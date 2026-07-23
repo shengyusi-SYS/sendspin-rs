@@ -600,6 +600,26 @@ struct CallbackStats {
     queue_low: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CallbackTimestampObservation {
+    timestamp: cpal::OutputStreamTimestamp,
+    source: cpal::OutputTimestampSource,
+    monotonic_violation: bool,
+}
+
+fn classify_output_timestamp(
+    timestamp: cpal::OutputStreamTimestamp,
+    source: cpal::OutputTimestampSource,
+    previous_playback: Option<cpal::StreamInstant>,
+) -> CallbackTimestampObservation {
+    CallbackTimestampObservation {
+        timestamp,
+        source,
+        monotonic_violation: previous_playback
+            .is_some_and(|previous| timestamp.playback <= previous),
+    }
+}
+
 impl CallbackStats {
     /// Reset per-generation counters, keeping the lifetime callback count.
     fn reset_for_generation(&mut self) {
@@ -1176,6 +1196,7 @@ impl SyncedPlayer {
         let mut handoff_warned = false;
         let mut sync_settle_logged = false;
         let mut last_callback_instant: Option<Instant> = None;
+        let mut last_playback_timestamp: Option<cpal::StreamInstant> = None;
         let mut last_playback_delta_us: Option<u64> = None;
         // Running minimum of the presentation-latency snapshot, reset per
         // generation. Reanchors anchor against this floor rather than one
@@ -1230,10 +1251,22 @@ impl SyncedPlayer {
                     let debug_logging = log::log_enabled!(log::Level::Debug);
                     let trace_logging = log::log_enabled!(log::Level::Trace);
 
-                    if !renderer_for_data.try_callback_heartbeat(scope) {
+                    let timestamp = info.timestamp();
+                    let timestamp_source = info.timestamp_source();
+                    let timestamp_observation = classify_output_timestamp(
+                        timestamp,
+                        timestamp_source,
+                        last_playback_timestamp,
+                    );
+                    if !renderer_for_data.try_callback_telemetry(
+                        scope,
+                        timestamp_observation.source,
+                        timestamp_observation.monotonic_violation,
+                    ) {
                         emit_silence(data);
                         return;
                     }
+                    last_playback_timestamp = Some(timestamp_observation.timestamp.playback);
 
                     stats.callbacks += 1;
                     let frames = data.len() / channels;
@@ -1327,7 +1360,7 @@ impl SyncedPlayer {
                     }
 
                     let callback_instant = Instant::now();
-                    let ts = info.timestamp();
+                    let ts = timestamp_observation.timestamp;
                     let playback_delta = ts.playback.duration_since(ts.callback);
                     let playback_instant = callback_instant + playback_delta;
                     let mut presentation_zone_us = None;
@@ -2048,10 +2081,10 @@ mod tests {
     // cannot run in CI.
 
     use super::{
-        abort_before_start_with_queue, canonical_presentation_zone_us, default_renderer_limits,
-        set_device_delay_state, teardown_with_queue, try_callback_queue, validate_enqueue_buffer,
-        validate_output_format, windows_default_buffer_frames, CallbackQueuePhase,
-        DeviceDelayError, DeviceDelayMs, PlaybackQueue, MAX_STATIC_DELAY_MS,
+        abort_before_start_with_queue, canonical_presentation_zone_us, classify_output_timestamp,
+        default_renderer_limits, set_device_delay_state, teardown_with_queue, try_callback_queue,
+        validate_enqueue_buffer, validate_output_format, windows_default_buffer_frames,
+        CallbackQueuePhase, DeviceDelayError, DeviceDelayMs, PlaybackQueue, MAX_STATIC_DELAY_MS,
     };
     use crate::audio::{
         AudioBuffer, AudioFormat, Codec, EnqueueOutcome, PlayerScope, PreStartAbortOutcome,
@@ -2087,6 +2120,68 @@ mod tests {
         let owner = RendererOwner::new(RendererQueueLimits::new(32, 8, 16).unwrap());
         let scope = owner.mint_scope().unwrap();
         (owner, scope, Arc::new(Mutex::new(PlaybackQueue::new())))
+    }
+
+    #[test]
+    fn timestamp_provenance_callback_observation_uses_value_and_source_pair() {
+        let first = cpal::OutputStreamTimestamp {
+            callback: cpal::StreamInstant::from_nanos(10),
+            playback: cpal::StreamInstant::from_nanos(20),
+        };
+        let equal = cpal::OutputStreamTimestamp {
+            callback: cpal::StreamInstant::from_nanos(11),
+            playback: cpal::StreamInstant::from_nanos(20),
+        };
+        let earlier = cpal::OutputStreamTimestamp {
+            callback: cpal::StreamInstant::from_nanos(12),
+            playback: cpal::StreamInstant::from_nanos(19),
+        };
+        let later = cpal::OutputStreamTimestamp {
+            callback: cpal::StreamInstant::from_nanos(13),
+            playback: cpal::StreamInstant::from_nanos(21),
+        };
+
+        let first_observation =
+            classify_output_timestamp(first, cpal::OutputTimestampSource::DevicePresentation, None);
+        assert_eq!(first_observation.timestamp, first);
+        assert_eq!(
+            first_observation.source,
+            cpal::OutputTimestampSource::DevicePresentation
+        );
+        assert!(!first_observation.monotonic_violation);
+
+        for (timestamp, source, expected_violation) in [
+            (equal, cpal::OutputTimestampSource::MonotonicFallback, true),
+            (earlier, cpal::OutputTimestampSource::Unspecified, true),
+            (
+                later,
+                cpal::OutputTimestampSource::DevicePresentation,
+                false,
+            ),
+        ] {
+            let observation = classify_output_timestamp(timestamp, source, Some(first.playback));
+            assert_eq!(observation.timestamp, timestamp);
+            assert_eq!(observation.source, source);
+            assert_eq!(observation.monotonic_violation, expected_violation);
+        }
+    }
+
+    #[test]
+    fn timestamp_provenance_survives_clear_and_reanchor_on_same_stream() {
+        let (owner, scope, queue) = renderer_harness();
+        assert!(owner.try_callback_telemetry(
+            scope,
+            cpal::OutputTimestampSource::DevicePresentation,
+            false,
+        ));
+        let before = owner.health(scope).unwrap().output_timestamps();
+
+        assert_eq!(owner.clear(scope), RendererOperationOutcome::Applied);
+        let delay_us = AtomicU64::new(0);
+        set_device_delay_state(&queue, &delay_us, DeviceDelayMs::new(25.0).unwrap());
+        assert!(queue.lock().force_reanchor);
+
+        assert_eq!(owner.health(scope).unwrap().output_timestamps(), before);
     }
 
     fn mono_buffer(timestamp: i64, frames: usize) -> AudioBuffer {

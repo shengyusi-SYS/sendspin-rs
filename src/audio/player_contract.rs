@@ -2,13 +2,20 @@
 // ABOUTME: Keeps queue accounting, health, and teardown races typed and observable
 
 use cpal::traits::StreamTrait;
-use cpal::Stream;
+use cpal::{OutputTimestampSource, Stream};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const CALLBACK_CLOSED: u64 = 1 << 63;
 const CALLBACK_COUNT_MASK: u64 = !CALLBACK_CLOSED;
+const TIMESTAMP_TELEMETRY_CLOSED: u64 = 1 << 63;
+const TIMESTAMP_TELEMETRY_CLOSING: u64 = 1 << 62;
+const TIMESTAMP_TELEMETRY_FLAGS: u64 = TIMESTAMP_TELEMETRY_CLOSED | TIMESTAMP_TELEMETRY_CLOSING;
+// Low bits form a single-writer sequence: even is stable, odd is committing.
+// CPAL invokes one data callback at a time for a stream. A concurrent attempt
+// fails instead of blocking the real-time thread.
+const TIMESTAMP_TELEMETRY_VERSION_MASK: u64 = !TIMESTAMP_TELEMETRY_FLAGS;
 
 /// Opaque identity for one opened renderer lifetime.
 ///
@@ -405,6 +412,52 @@ impl RendererCapacitySnapshot {
     }
 }
 
+/// Owner-generated same-callback output timestamp evidence.
+///
+/// ```compile_fail
+/// use sendspin::audio::OutputTimestampEvidenceSnapshot;
+/// let _ = OutputTimestampEvidenceSnapshot {
+///     device_presentation: 0, monotonic_fallback: 0,
+///     unspecified: 0, monotonic_violations: 0,
+/// };
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputTimestampEvidenceSnapshot {
+    device_presentation: u64,
+    monotonic_fallback: u64,
+    unspecified: u64,
+    monotonic_violations: u64,
+}
+
+impl OutputTimestampEvidenceSnapshot {
+    /// Callbacks whose playback timestamp came from the device presentation timeline.
+    pub fn device_presentation(self) -> u64 {
+        self.device_presentation
+    }
+
+    /// Callbacks whose host fell back to a monotonic callback timestamp.
+    pub fn monotonic_fallback(self) -> u64 {
+        self.monotonic_fallback
+    }
+
+    /// Callbacks whose host does not expose stable timestamp provenance.
+    pub fn unspecified(self) -> u64 {
+        self.unspecified
+    }
+
+    /// Playback timestamps that did not strictly advance within the opened stream.
+    pub fn monotonic_violations(self) -> u64 {
+        self.monotonic_violations
+    }
+
+    /// Callbacks that carried a timestamp value/source pair from the real output callback.
+    pub fn provenance_callback_count(self) -> u64 {
+        self.device_presentation
+            .saturating_add(self.monotonic_fallback)
+            .saturating_add(self.unspecified)
+    }
+}
+
 /// Owner-generated renderer health snapshot.
 ///
 /// ```compile_fail
@@ -412,6 +465,7 @@ impl RendererCapacitySnapshot {
 /// let _ = RendererHealthSnapshot {
 ///     scope: panic!(), queued_frames: 0, queued_buffers: 0, limits: panic!(),
 ///     consumed_frames: 0, callback_count: 0, underrun_frames: 0,
+///     output_timestamps: panic!(),
 ///     last_presentation_boundary_zone_us: None, fault: None, terminal: None,
 /// };
 /// ```
@@ -424,6 +478,7 @@ pub struct RendererHealthSnapshot {
     consumed_frames: u64,
     callback_count: u64,
     underrun_frames: u64,
+    output_timestamps: OutputTimestampEvidenceSnapshot,
     last_presentation_boundary_zone_us: Option<i64>,
     fault: Option<RendererFault>,
     terminal: Option<RendererTerminal>,
@@ -457,6 +512,10 @@ impl RendererHealthSnapshot {
     /// Frames emitted as presentation underrun silence.
     pub fn underrun_frames(self) -> u64 {
         self.underrun_frames
+    }
+    /// Same-callback output timestamp provenance and monotonicity evidence.
+    pub fn output_timestamps(self) -> OutputTimestampEvidenceSnapshot {
+        self.output_timestamps
     }
     /// Last trusted scheduled presentation boundary.
     pub fn last_presentation_boundary_zone_us(self) -> Option<i64> {
@@ -572,7 +631,14 @@ struct Shared {
     finalized: Condvar,
     active_scope: AtomicU64,
     callback_state: AtomicU64,
+    timestamp_telemetry_state: AtomicU64,
     underrun_frames: AtomicU64,
+    device_presentation_timestamps: AtomicU64,
+    monotonic_fallback_timestamps: AtomicU64,
+    unspecified_timestamps: AtomicU64,
+    timestamp_monotonic_violations: AtomicU64,
+    #[cfg(test)]
+    timestamp_snapshot_retries: AtomicU64,
 }
 
 enum FinalizeRequestOutcome {
@@ -607,7 +673,14 @@ impl RendererOwner {
                 finalized: Condvar::new(),
                 active_scope: AtomicU64::new(0),
                 callback_state: AtomicU64::new(CALLBACK_CLOSED),
+                timestamp_telemetry_state: AtomicU64::new(TIMESTAMP_TELEMETRY_CLOSED),
                 underrun_frames: AtomicU64::new(0),
+                device_presentation_timestamps: AtomicU64::new(0),
+                monotonic_fallback_timestamps: AtomicU64::new(0),
+                unspecified_timestamps: AtomicU64::new(0),
+                timestamp_monotonic_violations: AtomicU64::new(0),
+                #[cfg(test)]
+                timestamp_snapshot_retries: AtomicU64::new(0),
             }),
         }
     }
@@ -634,6 +707,25 @@ impl RendererOwner {
         debug_assert!(owner.terminal_resource.is_none());
         self.shared.active_scope.store(next, Ordering::Release);
         self.shared.underrun_frames.store(0, Ordering::Release);
+        self.shared
+            .device_presentation_timestamps
+            .store(0, Ordering::Release);
+        self.shared
+            .monotonic_fallback_timestamps
+            .store(0, Ordering::Release);
+        self.shared
+            .unspecified_timestamps
+            .store(0, Ordering::Release);
+        self.shared
+            .timestamp_monotonic_violations
+            .store(0, Ordering::Release);
+        #[cfg(test)]
+        self.shared
+            .timestamp_snapshot_retries
+            .store(0, Ordering::Release);
+        self.shared
+            .timestamp_telemetry_state
+            .store(0, Ordering::Release);
         self.shared.callback_state.store(0, Ordering::Release);
         owner.current = Some(ScopeState::new(scope));
         Ok(scope)
@@ -840,6 +932,75 @@ impl RendererOwner {
             .is_ok()
     }
 
+    pub(crate) fn try_callback_telemetry(
+        &self,
+        scope: PlayerScope,
+        source: OutputTimestampSource,
+        monotonic_violation: bool,
+    ) -> bool {
+        self.try_callback_telemetry_with(scope, source, monotonic_violation, || {})
+    }
+
+    fn try_callback_telemetry_with<F>(
+        &self,
+        scope: PlayerScope,
+        source: OutputTimestampSource,
+        monotonic_violation: bool,
+        before_commit: F,
+    ) -> bool
+    where
+        F: FnOnce(),
+    {
+        let Some(_writer) = self.begin_timestamp_telemetry(scope) else {
+            return false;
+        };
+        before_commit();
+        let heartbeat_recorded = self.try_callback_heartbeat(scope);
+        if !heartbeat_recorded {
+            return false;
+        }
+
+        let source_counter = match source {
+            OutputTimestampSource::DevicePresentation => {
+                &self.shared.device_presentation_timestamps
+            }
+            OutputTimestampSource::MonotonicFallback => &self.shared.monotonic_fallback_timestamps,
+            OutputTimestampSource::Unspecified => &self.shared.unspecified_timestamps,
+        };
+        saturating_increment(source_counter);
+        if monotonic_violation {
+            saturating_increment(&self.shared.timestamp_monotonic_violations);
+        }
+        true
+    }
+
+    fn begin_timestamp_telemetry(
+        &self,
+        scope: PlayerScope,
+    ) -> Option<TimestampTelemetryWriter<'_>> {
+        if self.shared.active_scope.load(Ordering::Acquire) != scope.id {
+            return None;
+        }
+        self.shared
+            .timestamp_telemetry_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                let version = state & TIMESTAMP_TELEMETRY_VERSION_MASK;
+                if state & TIMESTAMP_TELEMETRY_FLAGS != 0 || version & 1 != 0 {
+                    None
+                } else {
+                    Some((version.wrapping_add(1)) & TIMESTAMP_TELEMETRY_VERSION_MASK)
+                }
+            })
+            .ok()?;
+        let writer = TimestampTelemetryWriter {
+            state: &self.shared.timestamp_telemetry_state,
+        };
+        if self.shared.active_scope.load(Ordering::Acquire) != scope.id {
+            return None;
+        }
+        Some(writer)
+    }
+
     pub(crate) fn record_callback_underrun(&self, frames: u64) {
         let _ = self.shared.underrun_frames.fetch_update(
             Ordering::AcqRel,
@@ -849,6 +1010,50 @@ impl RendererOwner {
     }
 
     fn close_callback_telemetry(&self) {
+        // This runs only on owner/control threads. CLOSING fences new writers;
+        // an already-entered real-time writer never waits and publishes the
+        // stable even sequence from its Drop guard.
+        loop {
+            let state = self
+                .shared
+                .timestamp_telemetry_state
+                .load(Ordering::Acquire);
+            if state & TIMESTAMP_TELEMETRY_CLOSED != 0 {
+                break;
+            }
+            if state & TIMESTAMP_TELEMETRY_CLOSING == 0 {
+                if self
+                    .shared
+                    .timestamp_telemetry_state
+                    .compare_exchange(
+                        state,
+                        state | TIMESTAMP_TELEMETRY_CLOSING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+            let closing = self
+                .shared
+                .timestamp_telemetry_state
+                .load(Ordering::Acquire);
+            if closing & TIMESTAMP_TELEMETRY_VERSION_MASK & 1 != 0 {
+                std::thread::yield_now();
+                continue;
+            }
+            let closed = (closing & TIMESTAMP_TELEMETRY_VERSION_MASK) | TIMESTAMP_TELEMETRY_CLOSED;
+            if self
+                .shared
+                .timestamp_telemetry_state
+                .compare_exchange(closing, closed, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
         self.shared
             .callback_state
             .fetch_or(CALLBACK_CLOSED, Ordering::AcqRel);
@@ -1040,19 +1245,63 @@ impl RendererOwner {
         if state.scope != scope {
             return Err(RendererOperationOutcome::StaleScope);
         }
+        let (callback_count, output_timestamps) = self.callback_telemetry_snapshot();
         Ok(RendererHealthSnapshot {
             scope,
             queued_frames: state.queued_frames,
             queued_buffers: state.queued_buffers,
             limits: self.limits,
             consumed_frames: state.consumed_frames,
-            callback_count: self.shared.callback_state.load(Ordering::Acquire)
-                & CALLBACK_COUNT_MASK,
+            callback_count,
             underrun_frames: self.shared.underrun_frames.load(Ordering::Acquire),
+            output_timestamps,
             last_presentation_boundary_zone_us: state.last_boundary,
             fault: state.fault,
             terminal: state.terminal,
         })
+    }
+
+    fn callback_telemetry_snapshot(&self) -> (u64, OutputTimestampEvidenceSnapshot) {
+        // Owner-side seqlock read. A callback never waits for this reader; the
+        // reader retries if a writer overlaps the atomic snapshot.
+        loop {
+            let before = self
+                .shared
+                .timestamp_telemetry_state
+                .load(Ordering::Acquire);
+            if before & TIMESTAMP_TELEMETRY_VERSION_MASK & 1 != 0 {
+                #[cfg(test)]
+                self.shared
+                    .timestamp_snapshot_retries
+                    .fetch_add(1, Ordering::Release);
+                std::thread::yield_now();
+                continue;
+            }
+            let callback_count =
+                self.shared.callback_state.load(Ordering::Acquire) & CALLBACK_COUNT_MASK;
+            let output_timestamps = OutputTimestampEvidenceSnapshot {
+                device_presentation: self
+                    .shared
+                    .device_presentation_timestamps
+                    .load(Ordering::Acquire),
+                monotonic_fallback: self
+                    .shared
+                    .monotonic_fallback_timestamps
+                    .load(Ordering::Acquire),
+                unspecified: self.shared.unspecified_timestamps.load(Ordering::Acquire),
+                monotonic_violations: self
+                    .shared
+                    .timestamp_monotonic_violations
+                    .load(Ordering::Acquire),
+            };
+            let after = self
+                .shared
+                .timestamp_telemetry_state
+                .load(Ordering::Acquire);
+            if before == after {
+                return (callback_count, output_timestamps);
+            }
+        }
     }
 
     /// Read the shared terminal state for the current scope.
@@ -1318,6 +1567,28 @@ fn finalized_outcome(owner: &OwnerState, scope: PlayerScope, already: bool) -> T
     }
 }
 
+fn saturating_increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(1))
+    });
+}
+
+struct TimestampTelemetryWriter<'a> {
+    state: &'a AtomicU64,
+}
+
+impl Drop for TimestampTelemetryWriter<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                let flags = state & TIMESTAMP_TELEMETRY_FLAGS;
+                let version = state & TIMESTAMP_TELEMETRY_VERSION_MASK;
+                Some(flags | (version.wrapping_add(1) & TIMESTAMP_TELEMETRY_VERSION_MASK))
+            });
+    }
+}
+
 pub(crate) struct RendererCallbackPermit<'a> {
     owner: MutexGuard<'a, OwnerState>,
     scope: PlayerScope,
@@ -1372,11 +1643,12 @@ mod tests {
     use super::{
         OwnedTerminalResource, PreStartAbortOutcome, RendererOperationOutcome, RendererOwner,
         RendererQueueLimits, ScheduledArmOutcome, ScheduledStartOutcome, ScopeMintError,
-        StartState, TerminalOutcome,
+        StartState, TerminalOutcome, TIMESTAMP_TELEMETRY_CLOSING, TIMESTAMP_TELEMETRY_VERSION_MASK,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     struct DropProbe(Arc<AtomicUsize>);
 
@@ -1426,6 +1698,17 @@ mod tests {
             ),
             RendererOperationOutcome::Applied
         );
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for deterministic concurrency checkpoint"
+            );
+            thread::yield_now();
+        }
     }
 
     #[test]
@@ -1831,5 +2114,278 @@ mod tests {
         assert_eq!(capacity.current_frames(), 0);
         assert_eq!(capacity.current_buffers(), 0);
         assert_eq!(owner.start_state(scope).unwrap(), StartState::Idle);
+    }
+
+    #[test]
+    fn timestamp_provenance_counts_each_source_and_detects_non_monotonic() {
+        let (owner, scope) = owner_and_scope();
+        assert!(owner.try_callback_telemetry(
+            scope,
+            cpal::OutputTimestampSource::DevicePresentation,
+            false,
+        ));
+        assert!(owner.try_callback_telemetry(
+            scope,
+            cpal::OutputTimestampSource::MonotonicFallback,
+            true,
+        ));
+        assert!(owner.try_callback_telemetry(
+            scope,
+            cpal::OutputTimestampSource::Unspecified,
+            true,
+        ));
+
+        let health = owner.health(scope).unwrap();
+        let timestamps = health.output_timestamps();
+        assert_eq!(timestamps.device_presentation(), 1);
+        assert_eq!(timestamps.monotonic_fallback(), 1);
+        assert_eq!(timestamps.unspecified(), 1);
+        assert_eq!(timestamps.monotonic_violations(), 2);
+    }
+
+    #[test]
+    fn timestamp_provenance_sum_matches_provenance_count() {
+        let (owner, scope) = owner_and_scope();
+        for source in [
+            cpal::OutputTimestampSource::DevicePresentation,
+            cpal::OutputTimestampSource::DevicePresentation,
+            cpal::OutputTimestampSource::MonotonicFallback,
+            cpal::OutputTimestampSource::Unspecified,
+        ] {
+            assert!(owner.try_callback_telemetry(scope, source, false));
+            let health = owner.health(scope).unwrap();
+            let timestamps = health.output_timestamps();
+            assert_eq!(
+                timestamps.device_presentation()
+                    + timestamps.monotonic_fallback()
+                    + timestamps.unspecified(),
+                timestamps.provenance_callback_count()
+            );
+        }
+
+        assert_eq!(owner.close(scope), RendererOperationOutcome::Applied);
+        let before = owner.health(scope).unwrap();
+        assert!(!owner.try_callback_telemetry(
+            scope,
+            cpal::OutputTimestampSource::DevicePresentation,
+            false,
+        ));
+        assert_eq!(owner.health(scope).unwrap(), before);
+    }
+
+    #[test]
+    fn timestamp_provenance_is_scope_fenced_and_resets_on_reopen() {
+        let (owner, first) = owner_and_scope();
+        assert!(owner.try_callback_telemetry(
+            first,
+            cpal::OutputTimestampSource::MonotonicFallback,
+            true,
+        ));
+        let TerminalOutcome::Won(_) = owner.teardown(first) else {
+            panic!("first scope teardown must win")
+        };
+        let second = owner.mint_scope().unwrap();
+        assert!(!owner.try_callback_telemetry(
+            first,
+            cpal::OutputTimestampSource::DevicePresentation,
+            false,
+        ));
+        let health = owner.health(second).unwrap();
+        assert_eq!(health.callback_count(), 0);
+        assert_eq!(health.output_timestamps().device_presentation(), 0);
+        assert_eq!(health.output_timestamps().monotonic_fallback(), 0);
+        assert_eq!(health.output_timestamps().unspecified(), 0);
+        assert_eq!(health.output_timestamps().monotonic_violations(), 0);
+    }
+
+    #[test]
+    fn timestamp_provenance_stops_at_terminal_ack() {
+        let (owner, scope) = owner_and_scope();
+        let drops = Arc::new(AtomicUsize::new(0));
+        attach_probe(&owner, scope, Arc::clone(&drops));
+        assert!(owner.try_callback_telemetry(
+            scope,
+            cpal::OutputTimestampSource::DevicePresentation,
+            false,
+        ));
+        let TerminalOutcome::Won(finalization) = owner.teardown(scope) else {
+            panic!("teardown must win")
+        };
+        assert!(finalization.ack.callback_stopped());
+        assert!(finalization.ack.stream_released());
+        let final_health = owner.health(scope).unwrap();
+        assert!(!owner.try_callback_telemetry(
+            scope,
+            cpal::OutputTimestampSource::MonotonicFallback,
+            true,
+        ));
+        assert_eq!(owner.health(scope).unwrap(), final_health);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn timestamp_provenance_close_waits_for_inflight_commit() {
+        let (owner, scope) = owner_and_scope();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = {
+            let owner = owner.clone();
+            thread::spawn(move || {
+                owner.try_callback_telemetry_with(
+                    scope,
+                    cpal::OutputTimestampSource::DevicePresentation,
+                    false,
+                    || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closer = {
+            let owner = owner.clone();
+            thread::spawn(move || {
+                let outcome = owner.close(scope);
+                closed_tx.send(outcome).unwrap();
+            })
+        };
+        wait_until(|| {
+            let state = owner
+                .shared
+                .timestamp_telemetry_state
+                .load(Ordering::Acquire);
+            state & TIMESTAMP_TELEMETRY_CLOSING != 0
+                && state & TIMESTAMP_TELEMETRY_VERSION_MASK & 1 != 0
+        });
+        assert_eq!(closed_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap());
+        assert_eq!(closed_rx.recv().unwrap(), RendererOperationOutcome::Applied);
+        closer.join().unwrap();
+
+        let final_health = owner.health(scope).unwrap();
+        assert_eq!(final_health.callback_count(), 1);
+        assert_eq!(
+            final_health.output_timestamps().provenance_callback_count(),
+            1
+        );
+        for _ in 0..100 {
+            thread::yield_now();
+        }
+        assert_eq!(owner.health(scope).unwrap(), final_health);
+    }
+
+    #[test]
+    fn timestamp_provenance_health_waits_for_inflight_commit() {
+        let (owner, scope) = owner_and_scope();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = {
+            let owner = owner.clone();
+            thread::spawn(move || {
+                owner.try_callback_telemetry_with(
+                    scope,
+                    cpal::OutputTimestampSource::DevicePresentation,
+                    true,
+                    || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let (health_tx, health_rx) = mpsc::channel();
+        let reader = {
+            let owner = owner.clone();
+            thread::spawn(move || {
+                health_tx.send(owner.health(scope).unwrap()).unwrap();
+            })
+        };
+        wait_until(|| {
+            owner
+                .shared
+                .timestamp_snapshot_retries
+                .load(Ordering::Acquire)
+                > 0
+        });
+        assert_eq!(health_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap());
+        let health = health_rx.recv().unwrap();
+        reader.join().unwrap();
+        assert_eq!(health.callback_count(), 1);
+        assert_eq!(health.output_timestamps().device_presentation(), 1);
+        assert_eq!(health.output_timestamps().monotonic_violations(), 1);
+        assert_eq!(
+            health.output_timestamps().provenance_callback_count(),
+            health.callback_count()
+        );
+    }
+
+    #[test]
+    fn timestamp_provenance_terminal_ack_waits_for_inflight_commit() {
+        let (owner, scope) = owner_and_scope();
+        let drops = Arc::new(AtomicUsize::new(0));
+        attach_probe(&owner, scope, Arc::clone(&drops));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = {
+            let owner = owner.clone();
+            thread::spawn(move || {
+                owner.try_callback_telemetry_with(
+                    scope,
+                    cpal::OutputTimestampSource::MonotonicFallback,
+                    true,
+                    || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let (terminal_tx, terminal_rx) = mpsc::channel();
+        let finalizer = {
+            let owner = owner.clone();
+            thread::spawn(move || {
+                terminal_tx.send(owner.teardown(scope)).unwrap();
+            })
+        };
+        wait_until(|| {
+            let state = owner
+                .shared
+                .timestamp_telemetry_state
+                .load(Ordering::Acquire);
+            state & TIMESTAMP_TELEMETRY_CLOSING != 0
+                && state & TIMESTAMP_TELEMETRY_VERSION_MASK & 1 != 0
+        });
+        assert_eq!(terminal_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap());
+        let TerminalOutcome::Won(finalization) = terminal_rx.recv().unwrap() else {
+            panic!("teardown must win")
+        };
+        assert!(finalization.ack.callback_stopped());
+        assert!(finalization.ack.stream_released());
+        finalizer.join().unwrap();
+
+        let final_health = owner.health(scope).unwrap();
+        let timestamps = final_health.output_timestamps();
+        assert_eq!(timestamps.monotonic_fallback(), 1);
+        assert_eq!(timestamps.monotonic_violations(), 1);
+        for _ in 0..100 {
+            thread::yield_now();
+        }
+        assert_eq!(owner.health(scope).unwrap(), final_health);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

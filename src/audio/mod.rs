@@ -18,11 +18,11 @@ pub mod types;
 
 pub use gain::GainControl;
 pub use player_contract::{
-    EnqueueOutcome, OpenError, OutputBackendError, PlayerScope, PreStartAbortOutcome,
-    RendererCapacitySnapshot, RendererFault, RendererHealthSnapshot, RendererOperationOutcome,
-    RendererOwner, RendererQueueLimits, RendererQueueLimitsError, RendererTerminal,
-    ScheduledArmOutcome, ScheduledStartOutcome, ScopeMintError, StartState, TerminalAck,
-    TerminalFinalization, TerminalOutcome, TerminalState, TerminalWinner,
+    EnqueueOutcome, OpenError, OutputBackendError, OutputTimestampEvidenceSnapshot, PlayerScope,
+    PreStartAbortOutcome, RendererCapacitySnapshot, RendererFault, RendererHealthSnapshot,
+    RendererOperationOutcome, RendererOwner, RendererQueueLimits, RendererQueueLimitsError,
+    RendererTerminal, ScheduledArmOutcome, ScheduledStartOutcome, ScopeMintError, StartState,
+    TerminalAck, TerminalFinalization, TerminalOutcome, TerminalState, TerminalWinner,
 };
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};

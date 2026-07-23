@@ -169,9 +169,38 @@ fn health_and_capacity_are_owner_generated_and_complete() {
     assert_eq!(health.consumed_frames(), 2);
     assert_eq!(health.callback_count(), 1);
     assert_eq!(health.underrun_frames(), 3);
+    let timestamps = health.output_timestamps();
+    assert_eq!(timestamps.device_presentation(), 0);
+    assert_eq!(timestamps.monotonic_fallback(), 0);
+    assert_eq!(timestamps.unspecified(), 0);
+    assert_eq!(timestamps.monotonic_violations(), 0);
+    assert_eq!(timestamps.provenance_callback_count(), 0);
     assert_eq!(health.last_presentation_boundary_zone_us(), Some(55_000));
     assert_eq!(health.fault(), None);
     assert_eq!(health.terminal(), None);
+}
+
+#[test]
+fn legacy_record_callback_preserves_health_without_provenance() {
+    let owner = owner();
+    let scope = scope(&owner);
+    assert!(matches!(
+        owner.enqueue(scope, 4),
+        EnqueueOutcome::Accepted { .. }
+    ));
+    let provenance_before = owner.health(scope).unwrap().output_timestamps();
+
+    assert_eq!(
+        owner.record_callback(scope, 1, 2, Some(10_000)),
+        RendererOperationOutcome::Applied
+    );
+
+    let health = owner.health(scope).unwrap();
+    assert_eq!(health.callback_count(), 1);
+    assert_eq!(health.consumed_frames(), 1);
+    assert_eq!(health.underrun_frames(), 2);
+    assert_eq!(health.last_presentation_boundary_zone_us(), Some(10_000));
+    assert_eq!(health.output_timestamps(), provenance_before);
 }
 
 #[test]
