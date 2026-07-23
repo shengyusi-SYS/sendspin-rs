@@ -6,5 +6,7 @@ pub mod clock;
 /// Raw monotonic clock trait and platform implementations
 pub mod raw_clock;
 
-pub use clock::{ClockSync, SyncQuality};
+pub use clock::{
+    ClockHealthSnapshot, ClockQuality, ClockStaleReason, ClockSync, ClockUpdateOutcome,
+};
 pub use raw_clock::{Clock, DefaultClock};

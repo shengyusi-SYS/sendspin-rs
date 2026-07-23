@@ -5,6 +5,8 @@
 pub mod decode;
 /// Lock-free volume/mute control
 pub mod gain;
+/// Scope-fenced bounded renderer and terminal lifecycle contracts
+pub mod player_contract;
 /// Buffer pool for reusing audio sample buffers
 pub mod pool;
 /// Sync correction planner for drop/insert cadence
@@ -15,7 +17,17 @@ pub mod synced_player;
 pub mod types;
 
 pub use gain::GainControl;
+pub use player_contract::{
+    EnqueueOutcome, OpenError, OutputBackendError, PlayerScope, PreStartAbortOutcome,
+    RendererCapacitySnapshot, RendererFault, RendererHealthSnapshot, RendererOperationOutcome,
+    RendererOwner, RendererQueueLimits, RendererQueueLimitsError, RendererTerminal,
+    ScheduledArmOutcome, ScheduledStartOutcome, ScopeMintError, StartState, TerminalAck,
+    TerminalFinalization, TerminalOutcome, TerminalState, TerminalWinner,
+};
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};
-pub use synced_player::{ProcessCallback, SyncedPlayer, SyncedPlayerConfig};
+pub use synced_player::{
+    AudioBufferLifetime, DeviceDelayError, DeviceDelayMs, ProcessCallback, ReanchorRequired,
+    SyncedPlayer, SyncedPlayerConfig,
+};
 pub use types::{AudioBuffer, AudioFormat, Codec};

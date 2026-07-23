@@ -43,11 +43,13 @@ pub trait Clock: Send + Sync + 'static {
     fn micros_to_instant(&self, micros: i64) -> Option<Instant> {
         let now_micros = self.now_micros();
         let now_instant = Instant::now();
-        let delta = micros - now_micros;
+        let delta = i128::from(micros) - i128::from(now_micros);
+        let magnitude = u64::try_from(delta.unsigned_abs()).ok()?;
+        let duration = Duration::from_micros(magnitude);
         if delta >= 0 {
-            Some(now_instant + Duration::from_micros(delta as u64))
+            now_instant.checked_add(duration)
         } else {
-            now_instant.checked_sub(Duration::from_micros((-delta) as u64))
+            now_instant.checked_sub(duration)
         }
     }
 
@@ -61,15 +63,36 @@ pub trait Clock: Send + Sync + 'static {
     /// [`micros_to_instant`](Clock::micros_to_instant) for details).
     /// Sub-microsecond truncation from `Duration::as_micros()` introduces
     /// a consistent -0 to -1µs bias, which the Kalman filter absorbs trivially.
+    /// If the requested instant lies outside the representable `i64`
+    /// microsecond domain, the result explicitly saturates to `i64::MIN` or
+    /// `i64::MAX`; it never wraps or panics.
     fn instant_to_micros(&self, instant: Instant) -> i64 {
         let now_micros = self.now_micros();
         let now_instant = Instant::now();
-        let delta = if instant >= now_instant {
-            instant.duration_since(now_instant).as_micros() as i64
+        let (is_future, magnitude) = if instant >= now_instant {
+            (true, instant.duration_since(now_instant).as_micros())
         } else {
-            -(now_instant.duration_since(instant).as_micros() as i64)
+            (false, now_instant.duration_since(instant).as_micros())
         };
-        now_micros + delta
+        let Ok(magnitude) = i128::try_from(magnitude) else {
+            return if is_future { i64::MAX } else { i64::MIN };
+        };
+        let total = if is_future {
+            i128::from(now_micros).checked_add(magnitude)
+        } else {
+            i128::from(now_micros).checked_sub(magnitude)
+        };
+        match total {
+            Some(value) => i64::try_from(value).unwrap_or_else(|_| {
+                if value.is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
+            }),
+            None if is_future => i64::MAX,
+            None => i64::MIN,
+        }
     }
 }
 

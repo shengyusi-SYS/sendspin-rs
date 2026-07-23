@@ -246,3 +246,27 @@ fn test_mock_clock_bridge_round_trip() {
     // If micros_to_instant returned None, the mock's value was before
     // Instant's epoch — that's a valid outcome for this test.
 }
+
+#[test]
+fn test_raw_clock_bridge_extreme_micros_never_panics() {
+    let min_clock = MockClock::new(i64::MIN);
+    let _ = min_clock.micros_to_instant(i64::MAX);
+
+    let max_clock = MockClock::new(i64::MAX);
+    let _ = max_clock.micros_to_instant(i64::MIN);
+}
+
+#[test]
+fn test_raw_clock_instant_to_micros_explicitly_saturates_unrepresentable_values() {
+    let max_clock = MockClock::new(i64::MAX);
+    let future = Instant::now()
+        .checked_add(Duration::from_secs(24 * 60 * 60))
+        .expect("one day must be representable");
+    assert_eq!(max_clock.instant_to_micros(future), i64::MAX);
+
+    let min_clock = MockClock::new(i64::MIN);
+    let past = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("one second must be representable");
+    assert_eq!(min_clock.instant_to_micros(past), i64::MIN);
+}

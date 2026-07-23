@@ -2,6 +2,12 @@
 // ABOUTME: Uses DAC callback timestamps to drop/insert frames for alignment
 
 use crate::audio::gain::{GainControl, GainRamp};
+use crate::audio::player_contract::{
+    EnqueueOutcome, OpenError, OutputBackendError, PlayerScope, PreStartAbortOutcome,
+    RendererCallbackPermit, RendererCapacitySnapshot, RendererFault, RendererHealthSnapshot,
+    RendererOperationOutcome, RendererOwner, RendererQueueLimits, ScheduledArmOutcome,
+    ScheduledStartOutcome, StartState, TerminalOutcome,
+};
 use crate::audio::sync_correction::{
     CorrectionPlanner, CorrectionSchedule, EngageGate, SyncErrorFilter,
 };
@@ -9,11 +15,12 @@ use crate::audio::{AudioBuffer, AudioFormat};
 use crate::error::Error;
 use crate::log_sampling::should_log_sample;
 use crate::sync::ClockSync;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::DeviceTrait;
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
 use cpal::{Sample, I24};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,13 +49,54 @@ use std::time::{Duration, Instant};
 pub type ProcessCallback = Box<dyn FnMut(&mut [f32]) + Send + 'static>;
 
 /// Maximum static delay in milliseconds. The Sendspin protocol defines
-/// `static_delay_ms` over 0–5000; larger values are clamped to this.
+/// `static_delay_ms` over 0–5000; values outside that range are rejected.
 pub const MAX_STATIC_DELAY_MS: u16 = 5000;
+
+/// A validated device-output delay in milliseconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviceDelayMs(f64);
+
+/// Typed rejection for an invalid device-output delay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DeviceDelayError {
+    /// The supplied value was NaN or infinite.
+    #[error("device delay must be finite")]
+    NonFinite,
+    /// The supplied value was outside the inclusive 0..=5000ms range.
+    #[error("device delay must be in 0..=5000ms")]
+    OutOfRange,
+}
+
+impl DeviceDelayMs {
+    /// Validate a millisecond delay without clamping.
+    pub fn new(value: f64) -> Result<Self, DeviceDelayError> {
+        if !value.is_finite() {
+            return Err(DeviceDelayError::NonFinite);
+        }
+        if !(0.0..=f64::from(MAX_STATIC_DELAY_MS)).contains(&value) {
+            return Err(DeviceDelayError::OutOfRange);
+        }
+        Ok(Self(value))
+    }
+
+    /// Validated millisecond value.
+    pub fn get(self) -> f64 {
+        self.0
+    }
+
+    fn as_micros(self) -> u64 {
+        (self.0 * 1_000.0).round() as u64
+    }
+}
+
+/// Marker returned when a delay update requires a one-shot presentation reanchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReanchorRequired;
 
 /// Configuration for [`SyncedPlayer`] construction.
 pub struct SyncedPlayerConfig {
-    /// Audio output device. Uses the platform default output device when `None`.
-    pub device: Option<Device>,
+    /// Explicitly selected, leased audio output device.
+    device: Device,
     /// Initial playback volume, 0-100.
     pub volume: u8,
     /// Initial mute state.
@@ -60,33 +108,22 @@ pub struct SyncedPlayerConfig {
 }
 
 impl SyncedPlayerConfig {
-    /// Create a config with common playback defaults.
-    pub fn new() -> Self {
+    /// Create a config for an explicitly selected output device.
+    ///
+    /// The library never queries or falls back to the platform default device.
+    ///
+    /// ```compile_fail
+    /// use sendspin::audio::SyncedPlayerConfig;
+    /// let _ = SyncedPlayerConfig::new();
+    /// ```
+    pub fn new(device: Device) -> Self {
         Self {
-            device: None,
+            device,
             volume: 100,
             muted: false,
             buffer_size: None,
         }
     }
-}
-
-impl Default for SyncedPlayerConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Convert a protocol `static_delay_ms` value to microseconds, clamping to
-/// [`MAX_STATIC_DELAY_MS`]. Out-of-range values are clamped rather than
-/// rejected so a sloppy server can't disable playback timing entirely.
-const fn static_delay_ms_to_us(delay_ms: u16) -> u64 {
-    let clamped = if delay_ms > MAX_STATIC_DELAY_MS {
-        MAX_STATIC_DELAY_MS
-    } else {
-        delay_ms
-    };
-    clamped as u64 * 1_000
 }
 
 /// Endpoint buffer requested on Windows when the caller does not override
@@ -110,6 +147,94 @@ const fn static_delay_ms_to_us(delay_ms: u16) -> u64 {
 /// only after the already-queued frames drain.
 const WINDOWS_DEFAULT_BUFFER_MS: u32 = 40;
 
+const DEFAULT_RENDERER_FRAMES: usize = 96_000;
+const DEFAULT_RENDERER_BUFFERS: usize = 64;
+
+fn default_renderer_limits(sample_rate: u32) -> Result<RendererQueueLimits, Error> {
+    let max_chunk_frames = usize::try_from(sample_rate)
+        .map_err(|_| Error::Output("sample rate is not representable".to_string()))?
+        .min(DEFAULT_RENDERER_FRAMES);
+    RendererQueueLimits::new(
+        DEFAULT_RENDERER_FRAMES,
+        DEFAULT_RENDERER_BUFFERS,
+        max_chunk_frames,
+    )
+    .map_err(|_| Error::Output("invalid renderer queue limits".to_string()))
+}
+
+fn validate_output_format(format: &AudioFormat) -> Result<(), OpenError> {
+    if format.channels == 0 {
+        return Err(OpenError::UnsupportedFormat);
+    }
+    if format.sample_rate == 0 {
+        return Err(OpenError::UnsupportedFormat);
+    }
+    Ok(())
+}
+
+fn validate_enqueue_buffer(
+    player_format: &AudioFormat,
+    buffer: &AudioBuffer,
+) -> Result<(usize, i64), EnqueueOutcome> {
+    if buffer.format != *player_format {
+        return Err(EnqueueOutcome::FormatMismatch);
+    }
+    let channels = usize::from(player_format.channels);
+    if channels == 0
+        || player_format.sample_rate == 0
+        || !buffer.samples.len().is_multiple_of(channels)
+    {
+        return Err(EnqueueOutcome::InvalidBuffer);
+    }
+    let frames = buffer.samples.len() / channels;
+    let duration_numerator = (frames as u128)
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(u128::from(player_format.sample_rate) / 2))
+        .ok_or(EnqueueOutcome::InvalidBuffer)?;
+    let duration_us = duration_numerator / u128::from(player_format.sample_rate);
+    let duration_us = i64::try_from(duration_us).map_err(|_| EnqueueOutcome::InvalidBuffer)?;
+    buffer
+        .timestamp
+        .checked_add(duration_us)
+        .ok_or(EnqueueOutcome::InvalidBuffer)?;
+    Ok((frames, duration_us))
+}
+
+fn preflight_device_output_format(device: &Device, format: &AudioFormat) -> Result<(), OpenError> {
+    let default_config = device
+        .default_output_config()
+        .map_err(|error| OpenError::Backend(OutputBackendError::new(error.to_string())))?;
+    if !matches!(
+        default_config.sample_format(),
+        SampleFormat::F32
+            | SampleFormat::F64
+            | SampleFormat::I8
+            | SampleFormat::I16
+            | SampleFormat::I24
+            | SampleFormat::I32
+            | SampleFormat::I64
+            | SampleFormat::U8
+            | SampleFormat::U16
+            | SampleFormat::U32
+            | SampleFormat::U64
+    ) {
+        return Err(OpenError::UnsupportedFormat);
+    }
+    let supported = device
+        .supported_output_configs()
+        .map_err(|error| OpenError::Backend(OutputBackendError::new(error.to_string())))?
+        .any(|range| {
+            range.channels() == u16::from(format.channels)
+                && range.sample_format() == default_config.sample_format()
+                && range.min_sample_rate() <= format.sample_rate
+                && format.sample_rate <= range.max_sample_rate()
+        });
+    if !supported {
+        return Err(OpenError::UnsupportedFormat);
+    }
+    Ok(())
+}
+
 /// Frames for [`WINDOWS_DEFAULT_BUFFER_MS`] at `sample_rate`.
 const fn windows_default_buffer_frames(sample_rate: u32) -> u32 {
     sample_rate * WINDOWS_DEFAULT_BUFFER_MS / 1000
@@ -124,9 +249,27 @@ fn default_buffer_size(sample_rate: u32) -> cpal::BufferSize {
     }
 }
 
+/// Opaque owner token retained for exactly as long as an enqueued buffer.
+pub trait AudioBufferLifetime: Send + Sync {}
+
+impl<T: Send + Sync> AudioBufferLifetime for T {}
+
+struct QueuedAudioBuffer {
+    buffer: AudioBuffer,
+    _lifetime: Option<Arc<dyn AudioBufferLifetime>>,
+}
+
+impl Deref for QueuedAudioBuffer {
+    type Target = AudioBuffer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
 struct PlaybackQueue {
-    queue: VecDeque<AudioBuffer>,
-    current: Option<AudioBuffer>,
+    queue: VecDeque<QueuedAudioBuffer>,
+    current: Option<QueuedAudioBuffer>,
     index: usize,
     /// Current playback position in **server-time microseconds**. Periodically
     /// reanchored to the server's clock during clock-sync correction, so this
@@ -140,6 +283,14 @@ struct PlaybackQueue {
     /// Buffers enqueued in this generation; the sampling key for the enqueue
     /// trace line. Reset by `clear()`.
     enqueue_count: u64,
+}
+
+fn buffer_end_zone_us(buffer: &AudioBuffer) -> i128 {
+    let channels = i128::from(buffer.format.channels.max(1));
+    let frames = buffer.samples.len() as i128 / channels;
+    let rate = i128::from(buffer.format.sample_rate.max(1));
+    let duration_us = (frames * 1_000_000 + rate / 2) / rate;
+    i128::from(buffer.timestamp) + duration_us
 }
 
 impl PlaybackQueue {
@@ -169,7 +320,16 @@ impl PlaybackQueue {
         self.enqueue_count = 0;
     }
 
+    #[cfg(test)]
     fn push(&mut self, buffer: AudioBuffer) {
+        self.push_with_lifetime(buffer, None);
+    }
+
+    fn push_with_lifetime(
+        &mut self,
+        buffer: AudioBuffer,
+        lifetime: Option<Arc<dyn AudioBufferLifetime>>,
+    ) {
         // Initialize the cursor from the first enqueued buffer so the audio
         // callback can see a valid cursor_us before it starts reading. Without
         // this, the callback's pre-start gate can't evaluate timestamps and
@@ -199,11 +359,12 @@ impl PlaybackQueue {
         // discarded ~34% of all 44.1kHz audio (heard as continuous popping).
         let rate = i64::from(buffer.format.sample_rate.max(1));
         let frame_us = (1_000_000 + rate - 1) / rate;
-        let new_end = buffer.timestamp + buffer.duration_us();
+        let new_end = buffer_end_zone_us(&buffer);
         self.queue.retain(|b| {
-            let existing_end = b.timestamp + b.duration_us();
-            let overlap_us = new_end.min(existing_end) - buffer.timestamp.max(b.timestamp);
-            overlap_us < frame_us
+            let existing_end = buffer_end_zone_us(b);
+            let overlap_us =
+                new_end.min(existing_end) - i128::from(buffer.timestamp.max(b.timestamp));
+            overlap_us < i128::from(frame_us)
         });
 
         let pos = self
@@ -211,13 +372,27 @@ impl PlaybackQueue {
             .iter()
             .position(|b| b.timestamp > buffer.timestamp);
         if let Some(pos) = pos {
-            self.queue.insert(pos, buffer);
+            self.queue.insert(
+                pos,
+                QueuedAudioBuffer {
+                    buffer,
+                    _lifetime: lifetime,
+                },
+            );
         } else {
-            self.queue.push_back(buffer);
+            self.queue.push_back(QueuedAudioBuffer {
+                buffer,
+                _lifetime: lifetime,
+            });
         }
     }
 
-    fn next_frame(&mut self, channels: usize, sample_rate: u32) -> Option<&[i32]> {
+    fn consume_next_frame(
+        &mut self,
+        channels: usize,
+        sample_rate: u32,
+        destination: Option<&mut [i32]>,
+    ) -> bool {
         let needs_buffer = match self.current {
             None => true,
             Some(ref c) => self.index + channels > c.samples.len(),
@@ -226,7 +401,7 @@ impl PlaybackQueue {
             // Drop stale buffers that are entirely before the cursor.
             if self.initialized {
                 while let Some(front) = self.queue.front() {
-                    if front.timestamp + front.duration_us() < self.cursor_us {
+                    if buffer_end_zone_us(front) < i128::from(self.cursor_us) {
                         let _ = self.queue.pop_front();
                         continue;
                     }
@@ -288,14 +463,35 @@ impl PlaybackQueue {
         // Without this the cursor races ahead during underruns, causing
         // the stale-buffer-dropping logic to discard valid buffers when
         // audio resumes.
-        self.current.as_ref()?;
+        if self.current.is_none() {
+            return false;
+        }
 
         let start = self.index;
         let end = self.index + channels;
+        if let Some(destination) = destination {
+            destination.copy_from_slice(
+                &self.current.as_ref().expect("checked current").samples[start..end],
+            );
+        }
         self.index = end;
         self.advance_cursor(sample_rate);
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|current| self.index >= current.samples.len())
+        {
+            self.current = None;
+            self.index = 0;
+        }
+        true
+    }
 
-        Some(&self.current.as_ref()?.samples[start..end])
+    #[cfg(test)]
+    fn next_frame(&mut self, channels: usize, sample_rate: u32) -> Option<Vec<i32>> {
+        let mut frame = vec![0; channels];
+        self.consume_next_frame(channels, sample_rate, Some(&mut frame))
+            .then_some(frame)
     }
 
     fn advance_cursor(&mut self, sample_rate: u32) {
@@ -308,13 +504,13 @@ impl PlaybackQueue {
     fn first_playable_cursor_at_or_after(&self, server_time_us: i64) -> Option<i64> {
         if let Some(buffer) = self.current.as_ref() {
             let remaining_start = buffer.timestamp.max(self.cursor_us);
-            if buffer.timestamp + buffer.duration_us() > server_time_us.max(remaining_start) {
+            if buffer_end_zone_us(buffer) > i128::from(server_time_us.max(remaining_start)) {
                 return Some(remaining_start.max(server_time_us));
             }
         }
 
         for buffer in &self.queue {
-            if buffer.timestamp + buffer.duration_us() > server_time_us {
+            if buffer_end_zone_us(buffer) > i128::from(server_time_us) {
                 return Some(buffer.timestamp.max(server_time_us));
             }
         }
@@ -346,6 +542,14 @@ impl PlaybackQueue {
 /// Microseconds as fractional milliseconds, for log formatting.
 fn us_to_ms(us: u64) -> f64 {
     us as f64 / 1000.0
+}
+
+fn canonical_presentation_zone_us(
+    device_presentation_zone_us: Option<i64>,
+    static_delay_us: u64,
+) -> Option<i64> {
+    let delay_us = i64::try_from(static_delay_us).ok()?;
+    device_presentation_zone_us?.checked_add(delay_us)
 }
 
 /// Queue depth below which the edge-triggered "queue low" debug line fires.
@@ -415,13 +619,104 @@ struct CallbackConfig {
 
 struct CallbackOutputs {
     error: Arc<Mutex<Option<String>>>,
+    renderer: RendererOwner,
+    scope: PlayerScope,
+}
+
+#[derive(Clone, Copy)]
+enum CallbackQueuePhase {
+    TimingSnapshot,
+    StartupReanchor,
+    CorrectionReanchor,
+    Render,
+}
+
+enum StartupReanchorOutcome {
+    Applied(i64),
+    NoPlayable,
+    Stale,
+}
+
+fn try_callback_queue<T>(
+    renderer: &RendererOwner,
+    scope: PlayerScope,
+    queue: &Mutex<PlaybackQueue>,
+    silent_frames: usize,
+    _phase: CallbackQueuePhase,
+    operation: impl FnOnce(&mut PlaybackQueue, &mut RendererCallbackPermit<'_>) -> T,
+) -> Option<T> {
+    let (mut permit, mut queue) =
+        try_callback_queue_guards(renderer, scope, queue, silent_frames, _phase)?;
+    Some(operation(&mut queue, &mut permit))
+}
+
+fn try_callback_queue_guards<'a>(
+    renderer: &'a RendererOwner,
+    scope: PlayerScope,
+    queue: &'a Mutex<PlaybackQueue>,
+    silent_frames: usize,
+    _phase: CallbackQueuePhase,
+) -> Option<(RendererCallbackPermit<'a>, MutexGuard<'a, PlaybackQueue>)> {
+    let Some(permit) = renderer.try_callback_permit(scope) else {
+        renderer.record_callback_underrun(silent_frames as u64);
+        return None;
+    };
+    let Some(queue) = queue.try_lock() else {
+        drop(permit);
+        renderer.record_callback_underrun(silent_frames as u64);
+        return None;
+    };
+    Some((permit, queue))
+}
+
+fn abort_before_start_with_queue<F>(
+    owner: &RendererOwner,
+    scope: PlayerScope,
+    queue: &Mutex<PlaybackQueue>,
+    after_queue_lock: F,
+) -> PreStartAbortOutcome
+where
+    F: FnOnce(),
+{
+    let mut queue = queue.lock();
+    after_queue_lock();
+    owner.abort_before_start_with_actual(scope, || queue.clear())
+}
+
+fn teardown_with_queue(
+    owner: &RendererOwner,
+    scope: PlayerScope,
+    queue: &Mutex<PlaybackQueue>,
+) -> TerminalOutcome {
+    let mut queue = queue.lock();
+    let outcome = owner.teardown_with_actual(scope, || queue.clear());
+    drop(queue);
+    match outcome {
+        crate::audio::player_contract::ActualTeardownOutcome::Complete(outcome) => outcome,
+        crate::audio::player_contract::ActualTeardownOutcome::FinalizationPending => {
+            owner.wait_for_claimed_terminal(scope)
+        }
+    }
+}
+
+fn set_device_delay_state(
+    queue: &Mutex<PlaybackQueue>,
+    static_delay_us: &AtomicU64,
+    delay_ms: DeviceDelayMs,
+) {
+    let mut queue = queue.lock();
+    static_delay_us.store(delay_ms.as_micros(), Ordering::Relaxed);
+    if queue.initialized {
+        queue.force_reanchor = true;
+    }
 }
 
 /// Synced audio output with drift correction.
 pub struct SyncedPlayer {
     format: AudioFormat,
-    _stream: Stream,
     queue: Arc<Mutex<PlaybackQueue>>,
+    renderer: RendererOwner,
+    scope: PlayerScope,
     /// Last error from the audio stream callback, if any.
     last_error: Arc<Mutex<Option<String>>>,
     gain: GainControl,
@@ -442,8 +737,23 @@ impl SyncedPlayer {
         format: AudioFormat,
         clock_sync: Arc<Mutex<ClockSync>>,
         config: SyncedPlayerConfig,
-    ) -> Result<Self, Error> {
-        Self::build(format, clock_sync, config, None)
+    ) -> Result<Self, OpenError> {
+        Self::build(format, clock_sync, config, None, None)
+    }
+
+    /// Create a player bound to a caller-owned renderer scope.
+    ///
+    /// This is intended for route/lease authorities that must use the same
+    /// scope for device validation, callback fencing, capacity evidence, and
+    /// terminal acknowledgement.
+    pub fn new_with_renderer(
+        format: AudioFormat,
+        clock_sync: Arc<Mutex<ClockSync>>,
+        config: SyncedPlayerConfig,
+        renderer: RendererOwner,
+        scope: PlayerScope,
+    ) -> Result<Self, OpenError> {
+        Self::build(format, clock_sync, config, None, Some((renderer, scope)))
     }
 
     /// Create a player with a process callback for post-gain audio processing.
@@ -455,6 +765,7 @@ impl SyncedPlayer {
     /// ```no_run
     /// # use std::sync::Arc;
     /// # use parking_lot::Mutex;
+    /// # use cpal::traits::HostTrait;
     /// # use sendspin::audio::{AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
     /// # use sendspin::sync::ClockSync;
     /// # use sendspin::DefaultClock;
@@ -467,10 +778,13 @@ impl SyncedPlayer {
     ///     codec_header: None,
     /// };
     /// let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
+    /// let device = cpal::default_host()
+    ///     .default_output_device()
+    ///     .ok_or_else(|| std::io::Error::other("no output device available"))?;
     /// let player = SyncedPlayer::with_process_callback(
     ///     format,
     ///     clock_sync,
-    ///     SyncedPlayerConfig::new(),
+    ///     SyncedPlayerConfig::new(device),
     ///     Box::new(|data| { /* e.g. feed a VU meter or visualizer */ }),
     /// )?;
     /// # Ok(())
@@ -481,8 +795,8 @@ impl SyncedPlayer {
         clock_sync: Arc<Mutex<ClockSync>>,
         config: SyncedPlayerConfig,
         callback: ProcessCallback,
-    ) -> Result<Self, Error> {
-        Self::build(format, clock_sync, config, Some(callback))
+    ) -> Result<Self, OpenError> {
+        Self::build(format, clock_sync, config, Some(callback), None)
     }
 
     fn build(
@@ -490,17 +804,11 @@ impl SyncedPlayer {
         clock_sync: Arc<Mutex<ClockSync>>,
         config: SyncedPlayerConfig,
         process_callback: Option<ProcessCallback>,
-    ) -> Result<Self, Error> {
-        if format.channels == 0 {
-            return Err(Error::Output("channels must be > 0".to_string()));
-        }
-        let host = cpal::default_host();
-        let device = match config.device {
-            Some(device) => device,
-            None => host
-                .default_output_device()
-                .ok_or_else(|| Error::Output("No output device available".to_string()))?,
-        };
+        renderer_scope: Option<(RendererOwner, PlayerScope)>,
+    ) -> Result<Self, OpenError> {
+        validate_output_format(&format)?;
+        let device = config.device;
+        preflight_device_output_format(&device, &format)?;
 
         let stream_config = StreamConfig {
             channels: format.channels as u16,
@@ -517,6 +825,22 @@ impl SyncedPlayer {
         let last_error = Arc::new(Mutex::new(None));
         let gain = GainControl::new(config.volume, config.muted);
         let static_delay_us = Arc::new(AtomicU64::new(0));
+        let (renderer, scope) = match renderer_scope {
+            Some((renderer, scope)) => {
+                renderer
+                    .capacity(scope)
+                    .map_err(|_| OpenError::StaleGeneration)?;
+                (renderer, scope)
+            }
+            None => {
+                let renderer =
+                    RendererOwner::new(default_renderer_limits(format.sample_rate).map_err(
+                        |error| OpenError::Backend(OutputBackendError::new(error.to_string())),
+                    )?);
+                let scope = renderer.mint_scope()?;
+                (renderer, scope)
+            }
+        };
 
         let cb_config = CallbackConfig {
             gain_control: gain.clone(),
@@ -525,6 +849,8 @@ impl SyncedPlayer {
         };
         let callback_outputs = CallbackOutputs {
             error: Arc::clone(&last_error),
+            renderer: renderer.clone(),
+            scope,
         };
 
         let stream = Self::build_stream(
@@ -535,8 +861,26 @@ impl SyncedPlayer {
             format_clone,
             cb_config,
             callback_outputs,
-        )?;
-        stream.play().map_err(|e| Error::Output(e.to_string()))?;
+        )
+        .map_err(|error| OpenError::Backend(OutputBackendError::new(error.to_string())))?;
+        if renderer.attach_output_stream(scope, stream) != RendererOperationOutcome::Applied {
+            return Err(OpenError::Backend(OutputBackendError::new(
+                "renderer rejected opened stream ownership",
+            )));
+        }
+        match renderer.start_output_stream(scope) {
+            Ok(RendererOperationOutcome::Applied) => {}
+            Ok(_) => {
+                let _ = renderer.teardown(scope);
+                return Err(OpenError::Backend(OutputBackendError::new(
+                    "renderer rejected leased output stream startup",
+                )));
+            }
+            Err(error) => {
+                let _ = renderer.teardown(scope);
+                return Err(OpenError::Backend(error));
+            }
+        }
         log::info!(
             "SyncedPlayer started: {} channels, {} Hz, {}-bit",
             format.channels,
@@ -546,8 +890,9 @@ impl SyncedPlayer {
 
         Ok(Self {
             format,
-            _stream: stream,
             queue,
+            renderer,
+            scope,
             last_error,
             gain,
             static_delay_us,
@@ -558,20 +903,49 @@ impl SyncedPlayer {
     ///
     /// Scheduling uses `buffer.timestamp` (server time in microseconds) for
     /// drift-corrected playback.
-    pub fn enqueue(&self, buffer: AudioBuffer) {
-        let buffer_timestamp = buffer.timestamp;
-        let buffer_duration_us = buffer.duration_us();
+    pub fn enqueue(&self, buffer: AudioBuffer) -> EnqueueOutcome {
+        self.enqueue_with_optional_lifetime(buffer, None)
+    }
+
+    /// Enqueue a buffer while retaining an opaque owner token until the
+    /// buffer is consumed, cleared, rejected, or the player is dropped.
+    pub fn enqueue_with_lifetime(
+        &self,
+        buffer: AudioBuffer,
+        lifetime: Arc<dyn AudioBufferLifetime>,
+    ) -> EnqueueOutcome {
+        self.enqueue_with_optional_lifetime(buffer, Some(lifetime))
+    }
+
+    fn enqueue_with_optional_lifetime(
+        &self,
+        buffer: AudioBuffer,
+        lifetime: Option<Arc<dyn AudioBufferLifetime>>,
+    ) -> EnqueueOutcome {
         let channels = self.format.channels as usize;
+        let (frames, buffer_duration_us) = match validate_enqueue_buffer(&self.format, &buffer) {
+            Ok(validated) => validated,
+            Err(outcome) => return outcome,
+        };
+        let buffer_timestamp = buffer.timestamp;
         let sample_rate = self.format.sample_rate;
+        let mut queue = self.queue.lock();
+        let outcome = self.renderer.enqueue_with_actual(self.scope, frames, || {
+            queue.push_with_lifetime(buffer, lifetime);
+            queue.enqueue_count += 1;
+            (queue.queued_frames(channels), queue.buffer_count())
+        });
+        drop(queue);
+        if !matches!(outcome, EnqueueOutcome::Accepted { .. }) {
+            return outcome;
+        }
 
         // Snapshot log fields under the lock but log after dropping it: the
         // audio callback contends on this lock, and logging can block on I/O.
         // The O(buffers) depth walk runs only for sampled, trace-enabled
         // enqueues.
         let trace_fields = {
-            let mut queue = self.queue.lock();
-            queue.push(buffer);
-            queue.enqueue_count += 1;
+            let queue = self.queue.lock();
             if log::log_enabled!(log::Level::Trace) && should_log_sample(queue.enqueue_count) {
                 Some((
                     queue.enqueue_count,
@@ -597,6 +971,7 @@ impl SyncedPlayer {
                 generation,
             );
         }
+        outcome
     }
 
     /// Clear queued audio and reset playback state.
@@ -616,7 +991,13 @@ impl SyncedPlayer {
                     queue.generation,
                 )
             });
-            queue.clear();
+            if self
+                .renderer
+                .clear_with_actual(self.scope, || queue.clear())
+                != RendererOperationOutcome::Applied
+            {
+                return;
+            }
             fields
         };
 
@@ -641,7 +1022,50 @@ impl SyncedPlayer {
     /// state across the handoff. It does not reflect hardware or OS mixer
     /// changes made by the external source.
     pub fn release_audio_device(self) -> GainControl {
-        self.gain
+        let gain = self.gain.clone();
+        let _ = self.teardown();
+        gain
+    }
+
+    /// Current opaque renderer scope.
+    pub fn scope(&self) -> PlayerScope {
+        self.scope
+    }
+
+    /// Read bounded renderer capacity from the scope-fenced owner.
+    pub fn renderer_capacity(&self) -> Result<RendererCapacitySnapshot, RendererOperationOutcome> {
+        self.renderer.capacity(self.scope)
+    }
+
+    /// Read complete typed renderer health from the scope-fenced owner.
+    pub fn renderer_health(&self) -> Result<RendererHealthSnapshot, RendererOperationOutcome> {
+        self.renderer.health(self.scope)
+    }
+
+    /// Close queue acceptance and callback consumption without dropping the stream.
+    pub fn close(&self) -> RendererOperationOutcome {
+        self.renderer.close(self.scope)
+    }
+
+    /// Arm an explicit Zone presentation timestamp for this scope.
+    pub fn arm_scheduled_start(&self, start_at_zone_us: i64) -> ScheduledArmOutcome {
+        self.renderer
+            .arm_scheduled_start(self.scope, start_at_zone_us)
+    }
+
+    /// Read the scheduled presentation state for this scope.
+    pub fn start_state(&self) -> Result<StartState, RendererOperationOutcome> {
+        self.renderer.start_state(self.scope)
+    }
+
+    /// Abort only while the scheduled boundary has not won.
+    pub fn abort_before_start(&self) -> PreStartAbortOutcome {
+        abort_before_start_with_queue(&self.renderer, self.scope, &self.queue, || {})
+    }
+
+    /// Drop the stream through the sole shared terminal finalizer.
+    pub fn teardown(&self) -> TerminalOutcome {
+        teardown_with_queue(&self.renderer, self.scope, &self.queue)
     }
 
     /// Return the configured audio format.
@@ -694,30 +1118,35 @@ impl SyncedPlayer {
         self.gain.set_mute(muted);
     }
 
-    /// Set the static playback delay in milliseconds (0–[`MAX_STATIC_DELAY_MS`]).
+    /// Set a validated device playback delay.
     ///
     /// Compensates for external speaker/amplifier latency: the server pre-sends
     /// audio by this amount, so the player shifts each sample's emission earlier
-    /// by the same delay to keep alignment correct. Values above the maximum are
-    /// clamped. Takes effect on the next audio callback.
+    /// by the same delay to keep alignment correct. Takes effect on the next
+    /// audio callback.
     ///
     /// A delay change is an intentional local timing offset, not clock drift.
     /// Request a one-shot reanchor so the audio callback either skips forward or
     /// waits for the new target time instead of feeding the delay delta through
     /// pitch-shifting drift correction.
-    pub fn set_static_delay(&self, delay_ms: u16) {
-        self.static_delay_us
-            .store(static_delay_ms_to_us(delay_ms), Ordering::Relaxed);
+    pub fn set_device_delay(&self, delay_ms: DeviceDelayMs) -> ReanchorRequired {
+        set_device_delay_state(&self.queue, &self.static_delay_us, delay_ms);
+        ReanchorRequired
+    }
 
-        let mut queue = self.queue.lock();
-        if queue.initialized {
-            queue.force_reanchor = true;
-        }
+    /// Validate and set a protocol static delay without clamping.
+    pub fn set_static_delay(&self, delay_ms: u16) -> Result<ReanchorRequired, DeviceDelayError> {
+        DeviceDelayMs::new(f64::from(delay_ms)).map(|delay| self.set_device_delay(delay))
     }
 
     /// Current static delay in milliseconds.
     pub fn static_delay_ms(&self) -> u16 {
         (self.static_delay_us.load(Ordering::Relaxed) / 1_000) as u16
+    }
+
+    /// Current validated device delay in fractional milliseconds.
+    pub fn device_delay_ms(&self) -> f64 {
+        self.static_delay_us.load(Ordering::Relaxed) as f64 / 1_000.0
     }
 
     fn build_stream(
@@ -729,7 +1158,11 @@ impl SyncedPlayer {
         mut cb_config: CallbackConfig,
         outputs: CallbackOutputs,
     ) -> Result<Stream, Error> {
-        let CallbackOutputs { error } = outputs;
+        let CallbackOutputs {
+            error,
+            renderer,
+            scope,
+        } = outputs;
         let channels = format.channels as usize;
         let sample_rate = format.sample_rate;
         let planner = CorrectionPlanner::new();
@@ -766,7 +1199,9 @@ impl SyncedPlayer {
         stream_config.sample_rate = format.sample_rate;
 
         macro_rules! output_stream {
-            ($sample:ty) => {
+            ($sample:ty) => {{
+                let renderer_for_data = renderer.clone();
+                let renderer_for_error = renderer.clone();
                 device.build_output_stream(
                     stream_config,
                     move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
@@ -795,6 +1230,11 @@ impl SyncedPlayer {
                     let debug_logging = log::log_enabled!(log::Level::Debug);
                     let trace_logging = log::log_enabled!(log::Level::Trace);
 
+                    if !renderer_for_data.try_callback_heartbeat(scope) {
+                        emit_silence(data);
+                        return;
+                    }
+
                     stats.callbacks += 1;
                     let frames = data.len() / channels;
 
@@ -802,8 +1242,21 @@ impl SyncedPlayer {
                     // rechecked before consuming force_reanchor so a clear()
                     // racing with this callback cannot clear the next startup's
                     // one-shot handoff.
-                    let (generation, cursor_us, force_reanchor, queued_us, queued_buffers) = {
-                        let queue = queue.lock();
+                    let Some((
+                        start_state,
+                        generation,
+                        cursor_us,
+                        force_reanchor,
+                        delay_us,
+                        queued_us,
+                        queued_buffers,
+                    )) = try_callback_queue(
+                            &renderer_for_data,
+                            scope,
+                            &queue,
+                            frames,
+                            CallbackQueuePhase::TimingSnapshot,
+                            |queue, permit| {
                         let cursor = if queue.initialized {
                             Some(queue.cursor_us)
                         } else {
@@ -821,13 +1274,29 @@ impl SyncedPlayer {
                             (0, 0)
                         };
                         (
+                            permit.start_state(),
                             queue.generation,
                             cursor,
                             queue.force_reanchor,
+                            cb_config.static_delay_us.load(Ordering::Relaxed),
                             queued_us,
                             queued_buffers,
                         )
+                            },
+                        )
+                    else {
+                        emit_silence(data);
+                        return;
                     };
+                    // This first branch is an advisory snapshot only. Public
+                    // arm/clear operations may legally change the state before
+                    // the render permit is acquired below, so the render permit
+                    // remains the sole authority for the transition decision.
+                    match start_state {
+                        StartState::Idle
+                        | StartState::Armed { .. }
+                        | StartState::BoundaryWon { .. } => {}
+                    }
                     if generation != last_generation {
                         log::debug!(
                             "Playback queue generation changed: {} -> {}, queued={:.1}ms, buffers={}, callbacks={}, silent_callbacks={}, underrun_callbacks={}, underrun_frames={}, sync_lock_misses={}, correction_engagements={}",
@@ -861,6 +1330,7 @@ impl SyncedPlayer {
                     let ts = info.timestamp();
                     let playback_delta = ts.playback.duration_since(ts.callback);
                     let playback_instant = callback_instant + playback_delta;
+                    let mut presentation_zone_us = None;
 
                     // Both values are normally steady, so a step in either
                     // explains a sync-error step: a callback gap means this
@@ -916,12 +1386,17 @@ impl SyncedPlayer {
                         }
                     }
                     if let (Some(cursor_us), Some(sync)) = (cursor_us, sync) {
+                        presentation_zone_us = canonical_presentation_zone_us(
+                            sync.client_to_server_micros(
+                                sync.instant_to_client_micros(playback_instant),
+                            ),
+                            delay_us,
+                        );
                         // Emit each sample `delay` earlier so downstream
                         // (amp/speaker) latency lands it on time. The reanchor
                         // below adds the same delay in the local→server
                         // direction; the two signs must stay in step or the
                         // planner chases a phantom error every callback.
-                        let delay_us = cb_config.static_delay_us.load(Ordering::Relaxed);
                         let mut effective_cursor_us = cursor_us;
                         let sync_settled = sync.is_settled();
                         if sync_settled && !sync_settle_logged {
@@ -960,14 +1435,32 @@ impl SyncedPlayer {
                             let client_micros =
                                 sync.instant_to_client_micros(handoff_instant) + delay_us as i64;
                             if let Some(server_time) = sync.client_to_server_micros(client_micros) {
-                                let mut queue = queue.lock();
-                                if queue.generation == generation && queue.initialized {
-                                    if let Some(cursor_us) =
-                                        queue.first_playable_cursor_at_or_after(server_time)
-                                    {
+                                let Some(outcome) = try_callback_queue(
+                                    &renderer_for_data,
+                                    scope,
+                                    &queue,
+                                    frames,
+                                    CallbackQueuePhase::StartupReanchor,
+                                    |queue, _permit| {
+                                        if queue.generation != generation || !queue.initialized {
+                                            return StartupReanchorOutcome::Stale;
+                                        }
+                                        let Some(cursor_us) = queue
+                                            .first_playable_cursor_at_or_after(server_time)
+                                        else {
+                                            return StartupReanchorOutcome::NoPlayable;
+                                        };
                                         queue.cursor_us = cursor_us;
                                         queue.cursor_remainder = 0;
                                         queue.force_reanchor = false;
+                                        StartupReanchorOutcome::Applied(cursor_us)
+                                    },
+                                ) else {
+                                    emit_silence(data);
+                                    return;
+                                };
+                                match outcome {
+                                    StartupReanchorOutcome::Applied(cursor_us) => {
                                         effective_cursor_us = cursor_us;
                                         reanchor_applied = true;
                                         schedule = CorrectionSchedule::default();
@@ -983,13 +1476,16 @@ impl SyncedPlayer {
                                         log::debug!(
                                             "Sync reanchor applied: cursor reset to server_time={cursor_us}µs"
                                         );
-                                    } else if !handoff_warned {
+                                    }
+                                    StartupReanchorOutcome::NoPlayable if !handoff_warned => {
                                         handoff_warned = true;
                                         log::warn!(
                                             "Sync reanchor: no playable buffer at or after \
                                              server_time={server_time}µs — staying silent"
                                         );
                                     }
+                                    StartupReanchorOutcome::NoPlayable
+                                    | StartupReanchorOutcome::Stale => {}
                                 }
                             }
 
@@ -1195,9 +1691,22 @@ impl SyncedPlayer {
                                 if let Some(server_time) =
                                     sync.client_to_server_micros(client_micros)
                                 {
-                                    let mut queue = queue.lock();
-                                    queue.cursor_us = server_time;
-                                    queue.cursor_remainder = 0;
+                                    if try_callback_queue(
+                                        &renderer_for_data,
+                                        scope,
+                                        &queue,
+                                        frames,
+                                        CallbackQueuePhase::CorrectionReanchor,
+                                        |queue, _permit| {
+                                            queue.cursor_us = server_time;
+                                            queue.cursor_remainder = 0;
+                                        },
+                                    )
+                                    .is_none()
+                                    {
+                                        emit_silence(data);
+                                        return;
+                                    }
                                     log::debug!(
                                         "Sync reanchor applied: cursor reset to server_time={server_time}µs"
                                     );
@@ -1250,11 +1759,50 @@ impl SyncedPlayer {
                         return;
                     }
 
+                    let Some((mut renderer_permit, mut queue_guard)) =
+                        try_callback_queue_guards(
+                            &renderer_for_data,
+                            scope,
+                            &queue,
+                            frames,
+                            CallbackQueuePhase::Render,
+                        )
+                    else {
+                        emit_silence(data);
+                        return;
+                    };
+                    match renderer_permit.scheduled_start(presentation_zone_us) {
+                        ScheduledStartOutcome::Waiting { .. } => {
+                            drop(queue_guard);
+                            drop(renderer_permit);
+                            stats.silent_callbacks += 1;
+                            emit_silence(data);
+                            return;
+                        }
+                        ScheduledStartOutcome::BoundaryWon { start_at_zone_us } => {
+                            log::debug!(
+                                "Scheduled presentation boundary won: start_at_zone_us={start_at_zone_us}, callback={}, generation={}",
+                                stats.callbacks,
+                                generation,
+                            );
+                        }
+                        ScheduledStartOutcome::Unscheduled
+                        | ScheduledStartOutcome::Started { .. } => {}
+                        ScheduledStartOutcome::Closed | ScheduledStartOutcome::StaleScope => {
+                            debug_assert!(false, "callback permit guarantees an open current scope");
+                            drop(queue_guard);
+                            drop(renderer_permit);
+                            renderer_for_data.record_callback_underrun(frames as u64);
+                            emit_silence(data);
+                            return;
+                        }
+                    }
                     f32_buffer.resize(data.len(), 0.0);
 
                     let (callback_underrun_frames, queued_after_us, buffers_after) = {
-                        let mut queue = queue.lock();
+                        let queue = &mut *queue_guard;
                         let mut missing_frames = 0u64;
+                        let mut consumed_frames = 0usize;
                         let mut out_index = 0;
 
                         for _ in 0..frames {
@@ -1262,12 +1810,18 @@ impl SyncedPlayer {
                                 drop_counter = drop_counter.saturating_sub(1);
                                 if drop_counter == 0 {
                                     // Discard one frame to catch up
-                                    let _ = queue.next_frame(channels, sample_rate);
+                                    if queue.consume_next_frame(channels, sample_rate, None) {
+                                        consumed_frames += 1;
+                                    }
                                     drop_counter = schedule.drop_every_n_frames;
                                     // Get and output the next frame (don't repeat last_frame)
-                                    if let Some(frame) = queue.next_frame(channels, sample_rate) {
-                                        last_frame.copy_from_slice(frame);
-                                        for sample in frame {
+                                    if queue.consume_next_frame(
+                                        channels,
+                                        sample_rate,
+                                        Some(&mut last_frame),
+                                    ) {
+                                        consumed_frames += 1;
+                                        for sample in &last_frame {
                                             f32_buffer[out_index] = f32::from_sample(*sample);
                                             out_index += 1;
                                         }
@@ -1293,9 +1847,13 @@ impl SyncedPlayer {
                                 }
                             }
 
-                            if let Some(frame) = queue.next_frame(channels, sample_rate) {
-                                last_frame.copy_from_slice(frame);
-                                for sample in frame {
+                            if queue.consume_next_frame(
+                                channels,
+                                sample_rate,
+                                Some(&mut last_frame),
+                            ) {
+                                consumed_frames += 1;
+                                for sample in &last_frame {
                                     f32_buffer[out_index] = f32::from_sample(*sample);
                                     out_index += 1;
                                 }
@@ -1308,16 +1866,23 @@ impl SyncedPlayer {
                             }
                         }
 
-                        let (queued_after_us, buffers_after) = if debug_logging {
-                            (
-                                queue.queued_duration_us(channels, sample_rate),
-                                queue.buffer_count(),
-                            )
+                        let buffers_after = queue.buffer_count();
+                        let queued_after_us = if debug_logging {
+                            queue.queued_duration_us(channels, sample_rate)
                         } else {
-                            (0, 0)
+                            0
                         };
+                        renderer_permit.record_actual_progress(
+                            consumed_frames,
+                            None,
+                            queue.queued_frames(channels),
+                            buffers_after,
+                        );
                         (missing_frames, queued_after_us, buffers_after)
-                    }; // queue lock dropped before user callback
+                    };
+                    drop(queue_guard);
+                    drop(renderer_permit);
+                    renderer_for_data.record_callback_underrun(callback_underrun_frames);
 
                     let recovered = callback_underrun_frames == 0
                         && stats.consecutive_underrun_callbacks > 0;
@@ -1433,11 +1998,12 @@ impl SyncedPlayer {
                         }
                         log::error!("Audio stream error: {err}");
                         *error.lock() = Some(err.to_string());
+                        let _ = renderer_for_error.fault(scope, RendererFault::CallbackFailed);
                     },
                     None,
                 )
                 .map_err(|e| Error::Output(e.to_string()))
-            };
+            }};
         }
 
         log::debug!(
@@ -1468,6 +2034,12 @@ impl SyncedPlayer {
     }
 }
 
+impl Drop for SyncedPlayer {
+    fn drop(&mut self) {
+        let _ = self.teardown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Note: SyncedPlayer's convenience methods (volume, is_muted, set_volume,
@@ -1476,15 +2048,21 @@ mod tests {
     // cannot run in CI.
 
     use super::{
-        static_delay_ms_to_us, windows_default_buffer_frames, PlaybackQueue, SyncedPlayer,
-        SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
+        abort_before_start_with_queue, canonical_presentation_zone_us, default_renderer_limits,
+        set_device_delay_state, teardown_with_queue, try_callback_queue, validate_enqueue_buffer,
+        validate_output_format, windows_default_buffer_frames, CallbackQueuePhase,
+        DeviceDelayError, DeviceDelayMs, PlaybackQueue, MAX_STATIC_DELAY_MS,
     };
-    use crate::audio::{AudioBuffer, AudioFormat, Codec};
-    use crate::error::Error;
-    use crate::sync::{ClockSync, DefaultClock};
+    use crate::audio::{
+        AudioBuffer, AudioFormat, Codec, EnqueueOutcome, PlayerScope, PreStartAbortOutcome,
+        RendererFault, RendererOperationOutcome, RendererOwner, RendererQueueLimits,
+        ScheduledArmOutcome, ScheduledStartOutcome, StartState, TerminalOutcome,
+    };
     use cpal::Sample;
     use parking_lot::Mutex;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
 
     /// Standard test format: 48kHz stereo 24-bit PCM.
     fn test_format() -> AudioFormat {
@@ -1505,14 +2083,606 @@ mod tests {
         }
     }
 
+    fn renderer_harness() -> (RendererOwner, PlayerScope, Arc<Mutex<PlaybackQueue>>) {
+        let owner = RendererOwner::new(RendererQueueLimits::new(32, 8, 16).unwrap());
+        let scope = owner.mint_scope().unwrap();
+        (owner, scope, Arc::new(Mutex::new(PlaybackQueue::new())))
+    }
+
+    fn mono_buffer(timestamp: i64, frames: usize) -> AudioBuffer {
+        AudioBuffer {
+            timestamp,
+            samples: Arc::from(vec![0i32; frames]),
+            format: test_format_mono(),
+        }
+    }
+
+    fn enqueue_harness(
+        owner: &RendererOwner,
+        scope: PlayerScope,
+        queue: &Mutex<PlaybackQueue>,
+        buffer: AudioBuffer,
+    ) -> EnqueueOutcome {
+        let frames = buffer.samples.len();
+        let mut queue = queue.lock();
+        owner.enqueue_with_actual(scope, frames, || {
+            queue.push(buffer);
+            (queue.queued_frames(1), queue.buffer_count())
+        })
+    }
+
     #[test]
-    fn test_build_rejects_zero_channels() {
-        // `SyncedPlayer::build` short-circuits on channels==0 *before* any
-        // cpal device access, so this test works regardless of whether the
-        // runner has audio hardware. Asserting on the specific error message
-        // (not just `is_err()`) pins the check to the explicit guard — any
-        // later failure (missing device, cpal rejecting the config) would
-        // surface a different message.
+    fn renderer_callback_commit_cannot_overwrite_later_enqueue() {
+        let (owner, scope, queue) = renderer_harness();
+        assert!(matches!(
+            enqueue_harness(&owner, scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+
+        let mut permit = owner.try_callback_permit(scope).unwrap();
+        let mut queue_guard = queue.try_lock().unwrap();
+        assert!(queue_guard.next_frame(1, 48_000).is_some());
+        let queued_frames = queue_guard.queued_frames(1);
+        let queued_buffers = queue_guard.buffer_count();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let enqueue = {
+            let owner = owner.clone();
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let outcome = enqueue_harness(&owner, scope, &queue, mono_buffer(10_000, 2));
+                done_tx.send(()).unwrap();
+                outcome
+            })
+        };
+        started_rx.recv().unwrap();
+        assert_eq!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        permit.record_actual_progress(1, None, queued_frames, queued_buffers);
+        drop(queue_guard);
+        drop(permit);
+        assert!(matches!(
+            enqueue.join().unwrap(),
+            EnqueueOutcome::Accepted { .. }
+        ));
+
+        let queue = queue.lock();
+        let capacity = owner.capacity(scope).unwrap();
+        assert_eq!(capacity.current_frames(), queue.queued_frames(1));
+        assert_eq!(capacity.current_buffers(), queue.buffer_count());
+        assert_eq!(capacity.current_frames(), 5);
+    }
+
+    #[test]
+    fn close_after_heartbeat_fences_callback_consumption() {
+        let (owner, scope, queue) = renderer_harness();
+        assert!(matches!(
+            enqueue_harness(&owner, scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+        assert!(owner.try_callback_heartbeat(scope));
+        assert_eq!(owner.close(scope), RendererOperationOutcome::Applied);
+        assert!(owner.try_callback_permit(scope).is_none());
+
+        let queue = queue.lock();
+        assert_eq!(queue.queued_frames(1), 4);
+        let health = owner.health(scope).unwrap();
+        assert_eq!(health.queued_frames(), 4);
+        assert_eq!(health.consumed_frames(), 0);
+    }
+
+    #[test]
+    fn open_scope_queue_contention_silence_is_observable() {
+        let (owner, scope, queue) = renderer_harness();
+        let queue_guard = queue.lock();
+        for phase in [
+            CallbackQueuePhase::TimingSnapshot,
+            CallbackQueuePhase::StartupReanchor,
+            CallbackQueuePhase::CorrectionReanchor,
+            CallbackQueuePhase::Render,
+        ] {
+            assert!(owner.try_callback_heartbeat(scope));
+            assert!(try_callback_queue(&owner, scope, &queue, 6, phase, |_, _| {
+                unreachable!("contended queue must not run callback operation")
+            })
+            .is_none());
+        }
+        drop(queue_guard);
+
+        let health = owner.health(scope).unwrap();
+        assert_eq!(health.callback_count(), 4);
+        assert_eq!(health.underrun_frames(), 24);
+        assert_eq!(health.consumed_frames(), 0);
+    }
+
+    #[test]
+    fn scheduled_start_production_queue_waits_wins_and_reuses_frozen_boundary() {
+        let (owner, scope, queue) = renderer_harness();
+        assert!(matches!(
+            enqueue_harness(&owner, scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            owner.arm_scheduled_start(scope, 100),
+            ScheduledArmOutcome::Armed
+        );
+        assert_eq!(
+            owner.arm_scheduled_start(scope, 200),
+            ScheduledArmOutcome::AlreadyArmed {
+                start_at_zone_us: 100,
+            }
+        );
+
+        assert!(owner.try_callback_heartbeat(scope));
+        let waiting = try_callback_queue(
+            &owner,
+            scope,
+            &queue,
+            1,
+            CallbackQueuePhase::Render,
+            |queue, permit| {
+                let decision = permit.scheduled_start(Some(99));
+                (decision, queue.queued_frames(1), queue.buffer_count())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            waiting,
+            (
+                ScheduledStartOutcome::Waiting {
+                    start_at_zone_us: 100,
+                },
+                4,
+                1,
+            )
+        );
+        let waiting_health = owner.health(scope).unwrap();
+        assert_eq!(waiting_health.callback_count(), 1);
+        assert_eq!(waiting_health.consumed_frames(), 0);
+        assert_eq!(waiting_health.last_presentation_boundary_zone_us(), None);
+
+        assert!(owner.try_callback_heartbeat(scope));
+        let won = try_callback_queue(
+            &owner,
+            scope,
+            &queue,
+            1,
+            CallbackQueuePhase::Render,
+            |queue, permit| {
+                let decision = permit.scheduled_start(Some(100));
+                assert!(queue.next_frame(1, 48_000).is_some());
+                permit.record_actual_progress(
+                    1,
+                    None,
+                    queue.queued_frames(1),
+                    queue.buffer_count(),
+                );
+                decision
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            won,
+            ScheduledStartOutcome::BoundaryWon {
+                start_at_zone_us: 100,
+            }
+        );
+
+        assert!(owner.try_callback_heartbeat(scope));
+        let started = try_callback_queue(
+            &owner,
+            scope,
+            &queue,
+            1,
+            CallbackQueuePhase::Render,
+            |queue, permit| {
+                let decision = permit.scheduled_start(None);
+                assert!(queue.next_frame(1, 48_000).is_some());
+                permit.record_actual_progress(
+                    1,
+                    None,
+                    queue.queued_frames(1),
+                    queue.buffer_count(),
+                );
+                decision
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            started,
+            ScheduledStartOutcome::Started {
+                start_at_zone_us: 100,
+            }
+        );
+        let health = owner.health(scope).unwrap();
+        assert_eq!(health.callback_count(), 3);
+        assert_eq!(health.consumed_frames(), 2);
+        assert_eq!(health.last_presentation_boundary_zone_us(), Some(100));
+
+        {
+            let mut queue = queue.lock();
+            assert_eq!(
+                owner.clear_with_actual(scope, || queue.clear()),
+                RendererOperationOutcome::Applied
+            );
+            assert_eq!(queue.queued_frames(1), 0);
+            assert_eq!(queue.buffer_count(), 0);
+        }
+        assert_eq!(
+            owner.start_state(scope).unwrap(),
+            crate::audio::StartState::BoundaryWon {
+                start_at_zone_us: 100,
+            }
+        );
+        assert_eq!(
+            owner
+                .health(scope)
+                .unwrap()
+                .last_presentation_boundary_zone_us(),
+            Some(100)
+        );
+        assert_eq!(
+            owner.arm_scheduled_start(scope, 200),
+            ScheduledArmOutcome::BoundaryAlreadyWon {
+                start_at_zone_us: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn scheduled_start_honors_positive_static_delay() {
+        let (owner, scope, queue) = renderer_harness();
+        assert!(matches!(
+            enqueue_harness(&owner, scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            owner.arm_scheduled_start(scope, 100_000),
+            ScheduledArmOutcome::Armed
+        );
+
+        let before = canonical_presentation_zone_us(Some(94_999), 5_000);
+        let waiting = try_callback_queue(
+            &owner,
+            scope,
+            &queue,
+            1,
+            CallbackQueuePhase::Render,
+            |queue, permit| {
+                let outcome = permit.scheduled_start(before);
+                (outcome, queue.queued_frames(1), queue.buffer_count())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            waiting,
+            (
+                ScheduledStartOutcome::Waiting {
+                    start_at_zone_us: 100_000,
+                },
+                4,
+                1,
+            )
+        );
+
+        let at_boundary = canonical_presentation_zone_us(Some(95_000), 5_000);
+        let won = try_callback_queue(
+            &owner,
+            scope,
+            &queue,
+            1,
+            CallbackQueuePhase::Render,
+            |queue, permit| {
+                let outcome = permit.scheduled_start(at_boundary);
+                assert!(queue.next_frame(1, 48_000).is_some());
+                permit.record_actual_progress(
+                    1,
+                    None,
+                    queue.queued_frames(1),
+                    queue.buffer_count(),
+                );
+                outcome
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            won,
+            ScheduledStartOutcome::BoundaryWon {
+                start_at_zone_us: 100_000,
+            }
+        );
+        assert_eq!(owner.health(scope).unwrap().consumed_frames(), 1);
+        assert_eq!(canonical_presentation_zone_us(None, 5_000), None);
+        assert_eq!(canonical_presentation_zone_us(Some(i64::MAX), 1), None);
+        assert_eq!(canonical_presentation_zone_us(Some(0), u64::MAX), None);
+    }
+
+    #[test]
+    fn scheduled_start_timing_snapshot_changes_are_advisory() {
+        let (owner, idle_scope, queue) = renderer_harness();
+        assert!(matches!(
+            enqueue_harness(&owner, idle_scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+        let idle_snapshot = try_callback_queue(
+            &owner,
+            idle_scope,
+            &queue,
+            1,
+            CallbackQueuePhase::TimingSnapshot,
+            |_queue, permit| permit.start_state(),
+        )
+        .unwrap();
+        assert_eq!(idle_snapshot, StartState::Idle);
+        assert_eq!(
+            owner.arm_scheduled_start(idle_scope, 100),
+            ScheduledArmOutcome::Armed
+        );
+        let armed_after_idle_snapshot = try_callback_queue(
+            &owner,
+            idle_scope,
+            &queue,
+            1,
+            CallbackQueuePhase::Render,
+            |_queue, permit| permit.scheduled_start(Some(100)),
+        )
+        .unwrap();
+        assert_eq!(
+            armed_after_idle_snapshot,
+            ScheduledStartOutcome::BoundaryWon {
+                start_at_zone_us: 100,
+            }
+        );
+
+        assert!(owner.teardown(idle_scope).finalization().is_some());
+        queue.lock().clear();
+        let armed_scope = owner.mint_scope().expect("first scope released");
+        assert!(matches!(
+            enqueue_harness(&owner, armed_scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            owner.arm_scheduled_start(armed_scope, 200),
+            ScheduledArmOutcome::Armed
+        );
+        let armed_snapshot = try_callback_queue(
+            &owner,
+            armed_scope,
+            &queue,
+            1,
+            CallbackQueuePhase::TimingSnapshot,
+            |_queue, permit| permit.start_state(),
+        )
+        .unwrap();
+        assert_eq!(
+            armed_snapshot,
+            StartState::Armed {
+                start_at_zone_us: 200,
+            }
+        );
+        {
+            let mut actual_queue = queue.lock();
+            assert_eq!(
+                owner.clear_with_actual(armed_scope, || actual_queue.clear()),
+                RendererOperationOutcome::Applied
+            );
+        }
+        let idle_after_armed_snapshot = try_callback_queue(
+            &owner,
+            armed_scope,
+            &queue,
+            1,
+            CallbackQueuePhase::Render,
+            |_queue, permit| permit.scheduled_start(Some(200)),
+        )
+        .unwrap();
+        assert_eq!(
+            idle_after_armed_snapshot,
+            ScheduledStartOutcome::Unscheduled
+        );
+    }
+
+    #[test]
+    fn pre_start_abort_clears_actual_queue_and_fences_callback() {
+        let (owner, scope, queue) = renderer_harness();
+        assert!(matches!(
+            enqueue_harness(&owner, scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            owner.arm_scheduled_start(scope, 100),
+            ScheduledArmOutcome::Armed
+        );
+
+        let outcome = {
+            let mut queue = queue.lock();
+            owner.abort_before_start_with_actual(scope, || queue.clear())
+        };
+        assert!(matches!(outcome, PreStartAbortOutcome::Won(_)));
+        assert!(owner.try_callback_permit(scope).is_none());
+        let queue = queue.lock();
+        assert_eq!(queue.queued_frames(1), 0);
+        assert_eq!(queue.buffer_count(), 0);
+        let capacity = owner.capacity(scope).unwrap();
+        assert_eq!(capacity.current_frames(), 0);
+        assert_eq!(capacity.current_buffers(), 0);
+    }
+
+    #[test]
+    fn scheduled_start_callback_and_actual_abort_linearize() {
+        let (owner, scope, queue) = renderer_harness();
+        assert!(matches!(
+            enqueue_harness(&owner, scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            owner.arm_scheduled_start(scope, 100),
+            ScheduledArmOutcome::Armed
+        );
+        let mut permit = owner.try_callback_permit(scope).unwrap();
+        let queue_guard = queue.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let abort = {
+            let owner = owner.clone();
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                abort_before_start_with_queue(&owner, scope, &queue, || {})
+            })
+        };
+        started_rx.recv().unwrap();
+        assert_eq!(
+            permit.scheduled_start(Some(100)),
+            ScheduledStartOutcome::BoundaryWon {
+                start_at_zone_us: 100,
+            }
+        );
+        drop(queue_guard);
+        drop(permit);
+
+        assert_eq!(
+            abort.join().unwrap(),
+            PreStartAbortOutcome::BoundaryAlreadyWon {
+                start_at_zone_us: 100,
+            }
+        );
+        assert!(matches!(
+            owner.terminal_state(scope).unwrap(),
+            crate::audio::TerminalState::Open
+        ));
+        assert_eq!(queue.lock().queued_frames(1), 4);
+        assert_eq!(owner.capacity(scope).unwrap().current_frames(), 4);
+
+        assert!(owner.teardown(scope).finalization().is_some());
+        queue.lock().clear();
+        let abort_scope = owner.mint_scope().expect("first scope released");
+        assert!(matches!(
+            enqueue_harness(&owner, abort_scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            owner.arm_scheduled_start(abort_scope, 200),
+            ScheduledArmOutcome::Armed
+        );
+
+        let permit = owner.try_callback_permit(abort_scope).unwrap();
+        let (queue_locked_tx, queue_locked_rx) = mpsc::channel();
+        let abort = {
+            let owner = owner.clone();
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || {
+                abort_before_start_with_queue(&owner, abort_scope, &queue, || {
+                    queue_locked_tx.send(()).unwrap();
+                })
+            })
+        };
+        queue_locked_rx.recv().unwrap();
+        assert!(queue.try_lock().is_none());
+        drop(permit);
+
+        let PreStartAbortOutcome::Won(finalization) = abort.join().unwrap() else {
+            panic!("actual queue abort must win before the callback boundary")
+        };
+        assert_eq!(
+            finalization.winner,
+            crate::audio::TerminalWinner::PreStartAbort
+        );
+        assert!(owner.try_callback_permit(abort_scope).is_none());
+        assert_eq!(queue.lock().queued_frames(1), 0);
+        let capacity = owner.capacity(abort_scope).unwrap();
+        assert_eq!(capacity.current_frames(), 0);
+        assert_eq!(capacity.current_buffers(), 0);
+    }
+
+    #[test]
+    fn clear_and_enqueue_share_queue_owner_linearization() {
+        let (owner, scope, queue) = renderer_harness();
+        assert!(matches!(
+            enqueue_harness(&owner, scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let clear = {
+            let owner = owner.clone();
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || {
+                let mut queue = queue.lock();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                owner.clear_with_actual(scope, || queue.clear())
+            })
+        };
+        locked_rx.recv().unwrap();
+        let enqueue = {
+            let owner = owner.clone();
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || enqueue_harness(&owner, scope, &queue, mono_buffer(20_000, 3)))
+        };
+        release_tx.send(()).unwrap();
+        assert_eq!(clear.join().unwrap(), RendererOperationOutcome::Applied);
+        assert!(matches!(
+            enqueue.join().unwrap(),
+            EnqueueOutcome::Accepted { .. }
+        ));
+
+        let queue = queue.lock();
+        let capacity = owner.capacity(scope).unwrap();
+        assert_eq!(capacity.current_frames(), queue.queued_frames(1));
+        assert_eq!(capacity.current_buffers(), queue.buffer_count());
+        assert_eq!(
+            (capacity.current_frames(), capacity.current_buffers()),
+            (3, 1)
+        );
+    }
+
+    #[test]
+    fn clear_after_inflight_callback_clears_queue_and_owner_together() {
+        let (owner, scope, queue) = renderer_harness();
+        assert!(matches!(
+            enqueue_harness(&owner, scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+
+        let mut permit = owner.try_callback_permit(scope).unwrap();
+        let mut queue_guard = queue.try_lock().unwrap();
+        assert!(queue_guard.next_frame(1, 48_000).is_some());
+        let queued_frames = queue_guard.queued_frames(1);
+        let queued_buffers = queue_guard.buffer_count();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let clear = {
+            let owner = owner.clone();
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let mut queue = queue.lock();
+                let outcome = owner.clear_with_actual(scope, || queue.clear());
+                done_tx.send(()).unwrap();
+                outcome
+            })
+        };
+        started_rx.recv().unwrap();
+        assert_eq!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        permit.record_actual_progress(1, None, queued_frames, queued_buffers);
+        drop(queue_guard);
+        drop(permit);
+        assert_eq!(clear.join().unwrap(), RendererOperationOutcome::Applied);
+
+        let queue = queue.lock();
+        let capacity = owner.capacity(scope).unwrap();
+        assert_eq!(queue.queued_frames(1), 0);
+        assert_eq!(queue.buffer_count(), 0);
+        assert_eq!(capacity.current_frames(), 0);
+        assert_eq!(capacity.current_buffers(), 0);
+    }
+
+    #[test]
+    fn test_output_preflight_rejects_zero_channels_without_device_access() {
         let format = AudioFormat {
             codec: Codec::Pcm,
             sample_rate: 48_000,
@@ -1520,19 +2690,10 @@ mod tests {
             bit_depth: 24,
             codec_header: None,
         };
-        let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
-        let result = SyncedPlayer::new(format, clock_sync, SyncedPlayerConfig::new());
-        let err = match result {
-            Ok(_) => panic!("channels=0 should be rejected"),
-            Err(e) => e,
-        };
-        match err {
-            Error::Output(msg) => assert!(
-                msg.contains("channels must be > 0"),
-                "expected 'channels must be > 0' error, got: {msg}"
-            ),
-            other => panic!("expected Error::Output, got {other:?}"),
-        }
+        assert_eq!(
+            validate_output_format(&format),
+            Err(crate::audio::OpenError::UnsupportedFormat)
+        );
     }
 
     #[test]
@@ -1543,24 +2704,64 @@ mod tests {
     }
 
     #[test]
-    fn test_static_delay_ms_to_us_converts_and_clamps() {
-        // Nominal values convert milliseconds to microseconds.
-        assert_eq!(static_delay_ms_to_us(0), 0);
-        assert_eq!(static_delay_ms_to_us(100), 100_000);
+    fn device_delay_validates_without_clamping() {
+        assert_eq!(DeviceDelayMs::new(0.0).unwrap().as_micros(), 0);
+        assert_eq!(DeviceDelayMs::new(100.25).unwrap().as_micros(), 100_250);
         assert_eq!(
-            static_delay_ms_to_us(MAX_STATIC_DELAY_MS),
+            DeviceDelayMs::new(f64::from(MAX_STATIC_DELAY_MS))
+                .unwrap()
+                .as_micros(),
             MAX_STATIC_DELAY_MS as u64 * 1_000
         );
+        assert_eq!(DeviceDelayMs::new(-0.1), Err(DeviceDelayError::OutOfRange));
+        assert_eq!(
+            DeviceDelayMs::new(5000.1),
+            Err(DeviceDelayError::OutOfRange)
+        );
+        assert_eq!(
+            DeviceDelayMs::new(f64::NAN),
+            Err(DeviceDelayError::NonFinite)
+        );
+        assert_eq!(
+            DeviceDelayMs::new(f64::INFINITY),
+            Err(DeviceDelayError::NonFinite)
+        );
+    }
 
-        // Out-of-range values clamp to the maximum rather than overflow or wrap.
-        assert_eq!(
-            static_delay_ms_to_us(MAX_STATIC_DELAY_MS + 1),
-            MAX_STATIC_DELAY_MS as u64 * 1_000
-        );
-        assert_eq!(
-            static_delay_ms_to_us(u16::MAX),
-            MAX_STATIC_DELAY_MS as u64 * 1_000
-        );
+    #[test]
+    fn device_delay_value_and_reanchor_are_published_under_one_queue_lock() {
+        let queue = Arc::new(Mutex::new(PlaybackQueue::new()));
+        queue.lock().initialized = true;
+        queue.lock().force_reanchor = false;
+        let delay_us = Arc::new(AtomicU64::new(0));
+        let held = queue.lock();
+        let update = {
+            let queue = Arc::clone(&queue);
+            let delay_us = Arc::clone(&delay_us);
+            thread::spawn(move || {
+                set_device_delay_state(&queue, &delay_us, DeviceDelayMs::new(25.0).unwrap())
+            })
+        };
+        thread::yield_now();
+        assert_eq!(delay_us.load(Ordering::Relaxed), 0);
+        drop(held);
+        update.join().unwrap();
+        let snapshot = queue.lock();
+        assert!(snapshot.force_reanchor);
+        assert_eq!(delay_us.load(Ordering::Relaxed), 25_000);
+    }
+
+    #[test]
+    fn default_renderer_capacity_uses_gate0_hard_limits() {
+        let limits = default_renderer_limits(48_000).unwrap();
+        assert_eq!(limits.hard_frames(), 96_000);
+        assert_eq!(limits.hard_buffers(), 64);
+        assert_eq!(limits.max_chunk_frames(), 48_000);
+
+        let high_rate = default_renderer_limits(192_000).unwrap();
+        assert_eq!(high_rate.hard_frames(), 96_000);
+        assert_eq!(high_rate.hard_buffers(), 64);
+        assert_eq!(high_rate.max_chunk_frames(), 96_000);
     }
 
     #[test]
@@ -1579,6 +2780,321 @@ mod tests {
         assert_ne!(queue.generation, before);
         assert!(queue.queue.is_empty());
         assert!(!queue.initialized);
+    }
+
+    #[test]
+    fn capacity_lifetime_token_follows_queued_buffer_until_clear() {
+        struct DropCounter(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut queue = PlaybackQueue::new();
+        queue.push_with_lifetime(
+            AudioBuffer {
+                timestamp: 1234,
+                samples: Arc::from(vec![i32::EQUILIBRIUM; 96].into_boxed_slice()),
+                format: test_format(),
+            },
+            Some(Arc::new(DropCounter(Arc::clone(&drops)))),
+        );
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        queue.clear();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn capacity_lifetime_releases_on_last_frame_and_teardown() {
+        struct DropCounter(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut queue = PlaybackQueue::new();
+        queue.push_with_lifetime(
+            AudioBuffer {
+                timestamp: 0,
+                samples: Arc::from(vec![1].into_boxed_slice()),
+                format: AudioFormat {
+                    codec: Codec::Pcm,
+                    sample_rate: 48_000,
+                    channels: 1,
+                    bit_depth: 32,
+                    codec_header: None,
+                },
+            },
+            Some(Arc::new(DropCounter(Arc::clone(&drops)))),
+        );
+        assert!(queue.consume_next_frame(1, 48_000, None));
+        assert_eq!(queue.buffer_count(), 0);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let owner = RendererOwner::new(RendererQueueLimits::new(8, 2, 4).unwrap());
+        let scope = owner.mint_scope().unwrap();
+        let queue = Mutex::new(PlaybackQueue::new());
+        {
+            let mut queue = queue.lock();
+            let outcome = owner.enqueue_with_actual(scope, 1, || {
+                queue.push_with_lifetime(
+                    mono_buffer(1_000, 1),
+                    Some(Arc::new(DropCounter(Arc::clone(&drops)))),
+                );
+                (queue.queued_frames(1), queue.buffer_count())
+            });
+            assert!(matches!(outcome, EnqueueOutcome::Accepted { .. }));
+        }
+        let before = owner.capacity(scope).unwrap();
+        assert_eq!(before.current_frames(), 1);
+        assert_eq!(before.current_buffers(), 1);
+        let _ = teardown_with_queue(&owner, scope, &queue);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(queue.lock().buffer_count(), 0);
+        let after = owner.capacity(scope).unwrap();
+        assert_eq!(after.current_frames(), 0);
+        assert_eq!(after.current_buffers(), 0);
+    }
+
+    #[test]
+    fn terminal_loser_reconciles_actual_queue_after_fault_or_retained_owner_teardown() {
+        struct DropCounter(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        for mark_fault in [false, true] {
+            let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let owner = RendererOwner::new(RendererQueueLimits::new(8, 2, 4).unwrap());
+            let scope = owner.mint_scope().unwrap();
+            let queue = Mutex::new(PlaybackQueue::new());
+            {
+                let mut queue = queue.lock();
+                assert!(matches!(
+                    owner.enqueue_with_actual(scope, 1, || {
+                        queue.push_with_lifetime(
+                            mono_buffer(1_000, 1),
+                            Some(Arc::new(DropCounter(Arc::clone(&drops)))),
+                        );
+                        (queue.queued_frames(1), queue.buffer_count())
+                    }),
+                    EnqueueOutcome::Accepted { .. }
+                ));
+            }
+            if mark_fault {
+                assert_eq!(
+                    owner.fault(scope, RendererFault::CallbackFailed),
+                    RendererOperationOutcome::Applied
+                );
+            }
+
+            let _ = owner.teardown(scope);
+            let _ = teardown_with_queue(&owner, scope, &queue);
+            let _ = teardown_with_queue(&owner, scope, &queue);
+
+            assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(queue.lock().buffer_count(), 0);
+            let capacity = owner.capacity(scope).unwrap();
+            assert_eq!(capacity.current_frames(), 0);
+            assert_eq!(capacity.current_buffers(), 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_terminal_requests_release_actual_queue_once() {
+        struct DropCounter(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = Arc::new(RendererOwner::new(
+            RendererQueueLimits::new(8, 2, 4).unwrap(),
+        ));
+        let scope = owner.mint_scope().unwrap();
+        let queue = Arc::new(Mutex::new(PlaybackQueue::new()));
+        {
+            let mut queue = queue.lock();
+            assert!(matches!(
+                owner.enqueue_with_actual(scope, 1, || {
+                    queue.push_with_lifetime(
+                        mono_buffer(1_000, 1),
+                        Some(Arc::new(DropCounter(Arc::clone(&drops)))),
+                    );
+                    (queue.queued_frames(1), queue.buffer_count())
+                }),
+                EnqueueOutcome::Accepted { .. }
+            ));
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let retained_owner = Arc::clone(&owner);
+        let retained_barrier = Arc::clone(&barrier);
+        let retained = std::thread::spawn(move || {
+            retained_barrier.wait();
+            retained_owner.teardown(scope)
+        });
+        let player_owner = Arc::clone(&owner);
+        let player_queue = Arc::clone(&queue);
+        let player_barrier = Arc::clone(&barrier);
+        let player = std::thread::spawn(move || {
+            player_barrier.wait();
+            teardown_with_queue(&player_owner, scope, &player_queue)
+        });
+        barrier.wait();
+        retained.join().unwrap();
+        player.join().unwrap();
+        let _ = teardown_with_queue(&owner, scope, &queue);
+
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(queue.lock().buffer_count(), 0);
+        let capacity = owner.capacity(scope).unwrap();
+        assert_eq!(capacity.current_frames(), 0);
+        assert_eq!(capacity.current_buffers(), 0);
+    }
+
+    #[test]
+    fn pending_actual_teardown_claim_blocks_scope_rotation_until_stable_ack() {
+        struct DropCounter(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        struct BlockingDrop {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+        }
+
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = Arc::new(RendererOwner::new(
+            RendererQueueLimits::new(8, 2, 4).unwrap(),
+        ));
+        let scope = owner.mint_scope().unwrap();
+        let queue = Arc::new(Mutex::new(PlaybackQueue::new()));
+        {
+            let mut queue = queue.lock();
+            assert!(matches!(
+                owner.enqueue_with_actual(scope, 1, || {
+                    queue.push_with_lifetime(
+                        mono_buffer(1_000, 1),
+                        Some(Arc::new(DropCounter(Arc::clone(&drops)))),
+                    );
+                    (queue.queued_frames(1), queue.buffer_count())
+                }),
+                EnqueueOutcome::Accepted { .. }
+            ));
+        }
+        let (drop_started_tx, drop_started_rx) = mpsc::channel();
+        let (release_drop_tx, release_drop_rx) = mpsc::channel();
+        assert_eq!(
+            owner.attach_test_terminal_resource(
+                scope,
+                Box::new(BlockingDrop {
+                    started: drop_started_tx,
+                    release: release_drop_rx,
+                }),
+            ),
+            RendererOperationOutcome::Applied
+        );
+
+        let winner_owner = Arc::clone(&owner);
+        let winner = std::thread::spawn(move || winner_owner.teardown(scope));
+        drop_started_rx.recv().unwrap();
+        let loser_owner = Arc::clone(&owner);
+        let loser_queue = Arc::clone(&queue);
+        let loser =
+            std::thread::spawn(move || teardown_with_queue(&loser_owner, scope, &loser_queue));
+        while queue.lock().buffer_count() != 0 {
+            std::thread::yield_now();
+        }
+
+        let mint_owner = Arc::clone(&owner);
+        let (minted_tx, minted_rx) = mpsc::channel();
+        let mint = std::thread::spawn(move || {
+            let next = mint_owner.mint_scope().unwrap();
+            minted_tx.send(next).unwrap();
+        });
+        assert!(minted_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+
+        release_drop_tx.send(()).unwrap();
+        let TerminalOutcome::Won(won) = winner.join().unwrap() else {
+            panic!("retained owner must win terminal finalization")
+        };
+        let TerminalOutcome::Lost(observed) = loser.join().unwrap() else {
+            panic!("claimed actual-aware loser must observe the stable final ack")
+        };
+        assert_eq!(won, observed);
+        let next_scope = minted_rx.recv().unwrap();
+        mint.join().unwrap();
+        assert_ne!(scope, next_scope);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn enqueue_validation_rejects_mismatch_malformed_and_timeline_overflow() {
+        let format = test_format();
+        let valid = AudioBuffer {
+            timestamp: 0,
+            samples: Arc::from(vec![0; 4].into_boxed_slice()),
+            format: format.clone(),
+        };
+        assert_eq!(validate_enqueue_buffer(&format, &valid), Ok((2, 42)));
+
+        let hard_limit = AudioBuffer {
+            timestamp: 0,
+            samples: Arc::from(vec![0; 96_000 * 2].into_boxed_slice()),
+            format: format.clone(),
+        };
+        assert_eq!(
+            validate_enqueue_buffer(&format, &hard_limit),
+            Ok((96_000, 2_000_000))
+        );
+
+        let mismatch = AudioBuffer {
+            format: AudioFormat {
+                sample_rate: 44_100,
+                ..format.clone()
+            },
+            ..valid
+        };
+        assert_eq!(
+            validate_enqueue_buffer(&format, &mismatch),
+            Err(EnqueueOutcome::FormatMismatch)
+        );
+        let malformed = AudioBuffer {
+            timestamp: 0,
+            samples: Arc::from(vec![0; 3].into_boxed_slice()),
+            format: format.clone(),
+        };
+        assert_eq!(
+            validate_enqueue_buffer(&format, &malformed),
+            Err(EnqueueOutcome::InvalidBuffer)
+        );
+        let overflow = AudioBuffer {
+            timestamp: i64::MAX,
+            samples: Arc::from(vec![0; 2].into_boxed_slice()),
+            format,
+        };
+        assert_eq!(
+            validate_enqueue_buffer(&overflow.format, &overflow),
+            Err(EnqueueOutcome::InvalidBuffer)
+        );
     }
 
     #[test]
@@ -2227,7 +3743,7 @@ mod tests {
 
         queue.initialized = true;
         queue.cursor_us = 980;
-        queue.queue.push_back(AudioBuffer {
+        queue.push(AudioBuffer {
             timestamp: 0,
             samples: Arc::from(samples.into_boxed_slice()),
             format,
@@ -2258,12 +3774,12 @@ mod tests {
 
         queue.initialized = true;
         queue.cursor_us = 50_000;
-        queue.queue.push_back(AudioBuffer {
+        queue.push(AudioBuffer {
             timestamp: 49_000,
             samples: Arc::from(short_samples.into_boxed_slice()),
             format: format.clone(),
         });
-        queue.queue.push_back(AudioBuffer {
+        queue.push(AudioBuffer {
             timestamp: 50_000,
             samples: Arc::from(ahead_samples.into_boxed_slice()),
             format,

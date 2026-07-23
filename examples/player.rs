@@ -170,7 +170,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        None
+        cpal::default_host()
+            .default_output_device()
+            .ok_or("No default output device available")
+            .map(Some)?
     };
 
     // Use provided ID or generate a random UUID
@@ -434,7 +437,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             static_delay_ms = delay_ms;
                             if let Some(ref player) = synced_player {
-                                player.set_static_delay(delay_ms);
+                                if let Err(error) = player.set_static_delay(delay_ms) {
+                                    eprintln!("Rejected static delay: {error}");
+                                }
                             }
                             println!("Static delay set to {delay_ms} ms");
                         }
@@ -526,12 +531,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if synced_player.is_none() {
-                                let player_config = SyncedPlayerConfig {
-                                    device: device.as_ref().cloned(),
-                                    volume: 100,
-                                    muted: false,
-                                    buffer_size: None,
-                                };
+                                let player_config = SyncedPlayerConfig::new(
+                                    device.as_ref().expect("device resolved before playback").clone(),
+                                );
                                 match SyncedPlayer::new(
                                     fmt.clone(),
                                     Arc::clone(&clock_sync),
@@ -539,7 +541,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ) {
                                     Ok(player) => {
                                         println!("Synced audio output initialized");
-                                        player.set_static_delay(static_delay_ms);
+                                        if let Err(error) = player.set_static_delay(static_delay_ms) {
+                                            eprintln!("Rejected static delay: {error}");
+                                        }
                                         synced_player = Some(player);
                                     }
                                     Err(e) => {

@@ -34,7 +34,7 @@ impl TimeFilter {
         let process_variance = process_std_dev * process_std_dev;
         let forget_variance_factor = forget_factor * forget_factor;
         Self {
-            last_update: 0,
+            last_update: i64::MIN,
             count: 0,
             offset: 0.0,
             drift: 0.0,
@@ -53,7 +53,7 @@ impl TimeFilter {
     }
 
     fn update(&mut self, measurement: i64, max_error: i64, time_added: i64) {
-        if time_added <= self.last_update {
+        if self.count > 0 && time_added <= self.last_update {
             log::warn!(
                 "TimeFilter: non-monotonic sample rejected (t4={time_added} <= last_update={})",
                 self.last_update
@@ -61,13 +61,11 @@ impl TimeFilter {
             return;
         }
 
-        let dt = (time_added - self.last_update) as f64;
-        self.last_update = time_added;
-
         let update_std_dev = max_error as f64;
         let measurement_variance = update_std_dev * update_std_dev;
 
         if self.count == 0 {
+            self.last_update = time_added;
             self.count = 1;
             self.offset = measurement as f64;
             self.offset_covariance = measurement_variance;
@@ -80,6 +78,9 @@ impl TimeFilter {
             };
             return;
         }
+
+        let dt = (i128::from(time_added) - i128::from(self.last_update)) as f64;
+        self.last_update = time_added;
 
         if self.count == 1 {
             self.count = 2;
@@ -216,16 +217,43 @@ impl TimeFilter {
 
     fn compute_server_time(&self, client_time: i64) -> Option<i64> {
         let effective_drift = self.effective_drift()?;
-        let dt = (client_time - self.current.last_update) as f64;
+        let dt = (i128::from(client_time) - i128::from(self.current.last_update)) as f64;
         let offset = self.current.offset + effective_drift * dt;
-        Some(client_time + offset.round() as i64)
+        let rounded_offset = Self::rounded_f64_to_i128(offset)?;
+        let server_time = i128::from(client_time).checked_add(rounded_offset)?;
+        i64::try_from(server_time).ok()
     }
 
     fn compute_client_time(&self, server_time: i64) -> Option<i64> {
         let effective_drift = self.effective_drift()?;
+        if effective_drift == 0.0 {
+            let rounded_offset = Self::rounded_f64_to_i128(self.current.offset)?;
+            let client_time = i128::from(server_time).checked_sub(rounded_offset)?;
+            return i64::try_from(client_time).ok();
+        }
+
+        let denominator = 1.0 + effective_drift;
+        if !denominator.is_finite() || denominator == 0.0 {
+            return None;
+        }
         let numerator = server_time as f64 - self.current.offset
             + effective_drift * self.current.last_update as f64;
-        Some((numerator / (1.0 + effective_drift)).round() as i64)
+        let rounded = (numerator / denominator).round();
+        const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+        if !rounded.is_finite() || !(-I64_UPPER_EXCLUSIVE..I64_UPPER_EXCLUSIVE).contains(&rounded) {
+            return None;
+        }
+        Some(rounded as i64)
+    }
+
+    fn rounded_f64_to_i128(value: f64) -> Option<i128> {
+        let rounded = value.round();
+        const I128_UPPER_EXCLUSIVE: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+        if !rounded.is_finite() || !(-I128_UPPER_EXCLUSIVE..I128_UPPER_EXCLUSIVE).contains(&rounded)
+        {
+            return None;
+        }
+        Some(rounded as i128)
     }
 
     fn is_synchronized(&self) -> bool {
@@ -243,9 +271,9 @@ impl TimeFilter {
     }
 }
 
-/// Clock synchronization quality
+/// Clock synchronization quality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncQuality {
+pub enum ClockQuality {
     /// Good synchronization (RTT < 50ms)
     Good,
     /// Degraded synchronization (RTT 50-100ms)
@@ -254,12 +282,63 @@ pub enum SyncQuality {
     Lost,
 }
 
+/// Result of submitting one four-timestamp clock sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockUpdateOutcome {
+    /// The sample was accepted and applied to the canonical filter.
+    Applied,
+    /// The sample produced an impossible or excessive round-trip time.
+    RejectedInvalidRtt,
+    /// `t4` did not strictly advance beyond the last accepted sample.
+    RejectedNonMonotonicT4,
+}
+
+/// Why clock health is currently stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockStaleReason {
+    /// No valid sample has been accepted.
+    NoSamples,
+    /// The injected endpoint monotonic clock is behind the last valid `t4`.
+    EndpointClockBackwards,
+    /// The last valid sample is older than the freshness threshold.
+    SampleExpired,
+}
+
+/// Read-only health derived from the canonical filter and endpoint clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockHealthSnapshot {
+    /// Number of samples applied since construction or reset.
+    pub accepted_samples: u64,
+    /// Number of samples rejected for an impossible or excessive RTT.
+    pub rejected_invalid_rtt: u64,
+    /// Number of samples rejected because `t4` did not strictly advance.
+    pub rejected_non_monotonic_t4: u64,
+    /// Endpoint-clock `t4` of the last accepted sample.
+    pub last_valid_t4_us: Option<i64>,
+    /// RTT of the last accepted sample.
+    pub last_rtt_us: Option<i64>,
+    /// Whether conversions are currently available and fresh.
+    pub synchronized: bool,
+    /// Whether the fresh filter has received its settling sample count.
+    pub settled: bool,
+    /// Whether conversions are currently rejected for freshness.
+    pub stale: bool,
+    /// Reason the model is stale, if any.
+    pub stale_reason: Option<ClockStaleReason>,
+    /// Age of the last sample in the endpoint monotonic domain.
+    pub sample_age_us: Option<u64>,
+    /// RTT-derived quality, reported as lost while stale.
+    pub quality: ClockQuality,
+}
+
 /// Clock synchronization state
 pub struct ClockSync {
     /// Last known RTT in microseconds
     rtt_micros: Option<i64>,
-    /// When we computed this (for staleness detection)
-    last_update: Option<Instant>,
+    last_valid_t4_us: Option<i64>,
+    accepted_samples: u64,
+    rejected_invalid_rtt: u64,
+    rejected_non_monotonic_t4: u64,
     /// Drift-aware time filter
     filter: TimeFilter,
     /// Raw monotonic clock used for timestamps
@@ -270,7 +349,10 @@ impl std::fmt::Debug for ClockSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClockSync")
             .field("rtt_micros", &self.rtt_micros)
-            .field("last_update", &self.last_update)
+            .field("last_valid_t4_us", &self.last_valid_t4_us)
+            .field("accepted_samples", &self.accepted_samples)
+            .field("rejected_invalid_rtt", &self.rejected_invalid_rtt)
+            .field("rejected_non_monotonic_t4", &self.rejected_non_monotonic_t4)
             .field("filter", &self.filter)
             .finish()
     }
@@ -281,7 +363,10 @@ impl ClockSync {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             rtt_micros: None,
-            last_update: None,
+            last_valid_t4_us: None,
+            accepted_samples: 0,
+            rejected_invalid_rtt: 0,
+            rejected_non_monotonic_t4: 0,
             filter: TimeFilter::new(0.01, 1.001),
             clock,
         }
@@ -301,31 +386,51 @@ impl ClockSync {
     /// - `t2` = server_received (server loop µs)
     /// - `t3` = server_transmitted (server loop µs)
     /// - `t4` = client_received (raw monotonic µs from [`Clock::now_micros`])
-    pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) {
+    pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) -> ClockUpdateOutcome {
+        if self.last_valid_t4_us.is_some_and(|last| t4 <= last) {
+            self.rejected_non_monotonic_t4 = self.rejected_non_monotonic_t4.saturating_add(1);
+            log::debug!(
+                "Clock sync sample discarded: non-monotonic t4={}µs after {:?}",
+                t4,
+                self.last_valid_t4_us
+            );
+            return ClockUpdateOutcome::RejectedNonMonotonicT4;
+        }
+
         // RTT = (t4 - t1) - (t3 - t2)
-        let rtt = (t4 - t1) - (t3 - t2);
+        let rtt_wide = (i128::from(t4) - i128::from(t1)) - (i128::from(t3) - i128::from(t2));
 
         // Discard negative RTT (misordered timestamps) and high RTT
         // (network congestion). Store only valid RTT so that quality()
         // doesn't report Good on a negative value.
-        if !(0..=100_000).contains(&rtt) {
+        if !(0..=100_000).contains(&rtt_wide) {
             // Samples arrive at ~1Hz, so this stays bounded; a run of these
             // lines is the "sync is starving" diagnostic.
             log::debug!(
                 "Clock sync sample discarded: rtt={}µs outside 0..=100000µs (t1={}, t2={}, t3={}, t4={})",
-                rtt,
+                rtt_wide,
                 t1,
                 t2,
                 t3,
                 t4
             );
-            return;
+            self.rejected_invalid_rtt = self.rejected_invalid_rtt.saturating_add(1);
+            return ClockUpdateOutcome::RejectedInvalidRtt;
         }
-        self.rtt_micros = Some(rtt);
+        let rtt = rtt_wide as i64;
 
         // NTP offset = ((t2 - t1) + (t3 - t4)) / 2
-        // Use f64 division to avoid systematic ±0.5µs bias from integer truncation.
-        let measurement = (((t2 - t1) as f64 + (t3 - t4) as f64) / 2.0).round() as i64;
+        // Round half-microseconds away from zero without overflowing i64 intermediates.
+        let offset_sum = (i128::from(t2) - i128::from(t1)) + (i128::from(t3) - i128::from(t4));
+        let measurement_wide = if offset_sum >= 0 {
+            (offset_sum + 1) / 2
+        } else {
+            (offset_sum - 1) / 2
+        };
+        let Ok(measurement) = i64::try_from(measurement_wide) else {
+            self.rejected_invalid_rtt = self.rejected_invalid_rtt.saturating_add(1);
+            return ClockUpdateOutcome::RejectedInvalidRtt;
+        };
         // Floor max_error at 1µs so the Kalman filter always sees
         // nonzero measurement variance. RTT = 0 is legitimate on
         // localhost; without this floor, repeated zero-variance
@@ -335,7 +440,9 @@ impl ClockSync {
         let was_synced = self.filter.is_synchronized();
         let was_blocked = self.filter.conversions_blocked();
         self.filter.update(measurement, max_error, t4);
-        self.last_update = Some(Instant::now());
+        self.rtt_micros = Some(rtt);
+        self.last_valid_t4_us = Some(t4);
+        self.accepted_samples = self.accepted_samples.saturating_add(1);
         log::trace!(
             "Clock sync sample: offset={:.0}µs, rtt={}µs, drift={:.6}, synchronized={}",
             self.filter.offset,
@@ -358,6 +465,7 @@ impl ClockSync {
                 TimeFilter::MAX_DRIFT
             );
         }
+        ClockUpdateOutcome::Applied
     }
 
     /// Get current RTT in microseconds
@@ -367,7 +475,7 @@ impl ClockSync {
 
     /// Convert server loop microseconds to client clock microseconds
     pub fn server_to_client_micros(&self, server_micros: i64) -> Option<i64> {
-        if !self.filter.is_synchronized() {
+        if !self.health().synchronized {
             return None;
         }
         self.filter.compute_client_time(server_micros)
@@ -375,7 +483,7 @@ impl ClockSync {
 
     /// Convert client clock microseconds to server loop microseconds
     pub fn client_to_server_micros(&self, client_micros: i64) -> Option<i64> {
-        if !self.filter.is_synchronized() {
+        if !self.health().synchronized {
             return None;
         }
         self.filter.compute_server_time(client_micros)
@@ -407,31 +515,77 @@ impl ClockSync {
     }
 
     /// Get sync quality based on RTT
-    pub fn quality(&self) -> SyncQuality {
+    fn current_quality(&self) -> ClockQuality {
         match self.rtt_micros {
-            Some(rtt) if rtt < 50_000 => SyncQuality::Good,
-            Some(rtt) if rtt < 100_000 => SyncQuality::Degraded,
-            _ => SyncQuality::Lost,
+            Some(rtt) if rtt < 50_000 => ClockQuality::Good,
+            Some(rtt) if rtt <= 100_000 => ClockQuality::Degraded,
+            _ => ClockQuality::Lost,
         }
+    }
+
+    /// Get sync quality, failing closed while the model is stale.
+    pub fn quality(&self) -> ClockQuality {
+        self.health().quality
+    }
+
+    /// Return a deterministic health snapshot using the injected endpoint clock.
+    pub fn health(&self) -> ClockHealthSnapshot {
+        let now_us = self.clock.now_micros();
+        let (stale_reason, sample_age_us) = match self.last_valid_t4_us {
+            None => (Some(ClockStaleReason::NoSamples), None),
+            Some(last) if now_us < last => (Some(ClockStaleReason::EndpointClockBackwards), None),
+            Some(last) => {
+                let age = u64::try_from(i128::from(now_us) - i128::from(last))
+                    .expect("non-negative i64 timestamp delta always fits u64");
+                if age > 5_000_000 {
+                    (Some(ClockStaleReason::SampleExpired), Some(age))
+                } else {
+                    (None, Some(age))
+                }
+            }
+        };
+        let stale = stale_reason.is_some();
+        let synchronized =
+            self.filter.is_synchronized() && !self.filter.conversions_blocked() && !stale;
+        let settled = self.filter.is_settled() && synchronized;
+        ClockHealthSnapshot {
+            accepted_samples: self.accepted_samples,
+            rejected_invalid_rtt: self.rejected_invalid_rtt,
+            rejected_non_monotonic_t4: self.rejected_non_monotonic_t4,
+            last_valid_t4_us: self.last_valid_t4_us,
+            last_rtt_us: self.rtt_micros,
+            synchronized,
+            settled,
+            stale,
+            stale_reason,
+            sample_age_us,
+            quality: if stale {
+                ClockQuality::Lost
+            } else {
+                self.current_quality()
+            },
+        }
+    }
+
+    /// Clear all filter, quality, sample and readiness state while retaining the endpoint clock.
+    pub fn reset(&mut self) {
+        self.rtt_micros = None;
+        self.last_valid_t4_us = None;
+        self.accepted_samples = 0;
+        self.rejected_invalid_rtt = 0;
+        self.rejected_non_monotonic_t4 = 0;
+        self.filter = TimeFilter::new(0.01, 1.001);
     }
 
     /// Check if sync is stale (>5 seconds since last update).
     ///
-    /// Uses `Instant::now()` (not the injected [`Clock`]) because staleness
-    /// is a wall-clock concept — we're measuring real elapsed time since the
-    /// last successful sync round, regardless of which timebase the filter
-    /// operates on. This means `is_stale()` always reflects real time even
-    /// when a mock clock is injected for testing.
     pub fn is_stale(&self) -> bool {
-        match self.last_update {
-            Some(last) => last.elapsed() > Duration::from_secs(5),
-            None => true,
-        }
+        self.health().stale
     }
 
     /// Check if clock sync has converged
     pub fn is_synchronized(&self) -> bool {
-        self.filter.is_synchronized()
+        self.health().synchronized
     }
 
     /// Whether the estimate has settled enough to drive fine-grained
@@ -439,7 +593,7 @@ impl ClockSync {
     /// means conversions are available at all: playback starts when
     /// synchronized; the correction planner waits until settled.
     pub fn is_settled(&self) -> bool {
-        self.filter.is_settled()
+        self.health().settled
     }
 }
 

@@ -944,13 +944,21 @@ fn test_server_time_deserialization() {
 
 #[test]
 fn test_server_time_fields_feed_clock_sync() {
-    use sendspin::sync::{ClockSync, DefaultClock};
+    use sendspin::sync::{Clock, ClockSync};
     use std::sync::Arc;
+
+    struct FixedEndpointClock;
+
+    impl Clock for FixedEndpointClock {
+        fn now_micros(&self) -> i64 {
+            5_000_000
+        }
+    }
 
     // Simulate two sync rounds using the same field mapping
     // that message_router uses: st.client_transmitted = t1,
     // st.server_received = t2, st.server_transmitted = t3.
-    let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
+    let mut sync = ClockSync::new(Arc::new(FixedEndpointClock));
     assert!(!sync.is_synchronized());
 
     let st1 = ServerTime {
