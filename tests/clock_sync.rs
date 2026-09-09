@@ -48,6 +48,91 @@ fn conversion_snapshot(sync: &ClockSync) -> ([Option<i64>; 4], [Option<i64>; 4])
 }
 
 #[test]
+fn same_clock_converts_without_samples_and_does_not_expire() {
+    let clock = Arc::new(Gate0Clock::new(253_000_000_000));
+    let mut sync = ClockSync::new_same_clock(clock.clone());
+
+    for now in [253_000_000_000, 253_006_000_000, 339_400_000_000] {
+        clock.set(now);
+        assert_eq!(sync.client_to_server_micros(now), Some(now));
+        assert_eq!(
+            sync.server_to_client_micros(now + 1_250_000),
+            Some(now + 1_250_000)
+        );
+        let health = sync.health();
+        assert!(health.synchronized && health.settled && !health.stale);
+        assert_eq!(health.quality, ClockQuality::Good);
+        assert_eq!(health.accepted_samples, 0);
+        assert_eq!(health.last_valid_t4_us, None);
+        assert_eq!(health.last_rtt_us, None);
+        assert_eq!(health.sample_age_us, None);
+        assert_eq!(health.stale_reason, None);
+    }
+
+    sync.reset();
+    assert!(sync.is_synchronized() && sync.is_settled() && !sync.is_stale());
+    for point in [i64::MIN, -1, 0, i64::MAX] {
+        assert_eq!(sync.client_to_server_micros(point), Some(point));
+        assert_eq!(sync.server_to_client_micros(point), Some(point));
+    }
+}
+
+#[test]
+fn same_clock_ignores_samples_instead_of_estimating_an_offset() {
+    let clock = Arc::new(Gate0Clock::new(1_000));
+    let mut sync = ClockSync::new_same_clock(clock.clone());
+    let before = sync.health();
+    for now in [1_000, 2_000, 6_002_000] {
+        clock.set(now);
+        assert_eq!(
+            sync.update(now - 100, now + 50_000, now + 50_000, now),
+            sendspin::sync::ClockUpdateOutcome::IgnoredSameClock
+        );
+        assert_eq!(sync.client_to_server_micros(now), Some(now));
+        assert_eq!(sync.health(), before);
+        assert_eq!(sync.rtt_micros(), None);
+    }
+}
+
+#[test]
+fn same_clock_scheduled_start_and_presentation_share_the_injected_instant_bridge() {
+    use sendspin::sync::Clock;
+    use std::time::{Duration, Instant};
+
+    // Fixed paired epochs make the callback's two conversion directions
+    // deterministic without a sleep or a scheduler-dependent error tolerance.
+    struct PairedClock(Instant);
+    impl Clock for PairedClock {
+        fn now_micros(&self) -> i64 {
+            253_000_000_000
+        }
+        fn micros_to_instant(&self, micros: i64) -> Option<Instant> {
+            self.0.checked_add(Duration::from_micros(
+                u64::try_from(micros - self.now_micros()).ok()?,
+            ))
+        }
+        fn instant_to_micros(&self, instant: Instant) -> i64 {
+            self.now_micros() + instant.duration_since(self.0).as_micros() as i64
+        }
+    }
+    let epoch = Instant::now();
+    let sync = ClockSync::new_same_clock(Arc::new(PairedClock(epoch)));
+    let presentation = epoch + Duration::from_millis(1_250);
+    assert_eq!(
+        sync.server_to_local_instant(253_001_250_000),
+        Some(presentation)
+    );
+    assert_eq!(
+        sync.client_to_server_micros(sync.instant_to_client_micros(presentation)),
+        Some(253_001_250_000)
+    );
+    assert_eq!(
+        sync.server_to_local_instant_with_latency(253_001_250_000, 250_000),
+        Some(epoch + Duration::from_secs(1))
+    );
+}
+
+#[test]
 fn test_fresh_clock_sync_initial_state() {
     let sync = ClockSync::new(Arc::new(Gate0Clock::new(5_000_000)));
 

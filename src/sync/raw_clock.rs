@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 /// A monotonic time source for clock synchronization.
 ///
 /// Implementations must return microseconds from a stable, monotonic source
-/// that is **not** conditioned by NTP rate adjustments (slewing). On Linux,
-/// this means `CLOCK_MONOTONIC_RAW` rather than `CLOCK_MONOTONIC`.
+/// that, when estimating between distinct clocks, is **not** conditioned by
+/// NTP rate adjustments (slewing). On Linux, this means `CLOCK_MONOTONIC_RAW`
+/// rather than `CLOCK_MONOTONIC`. An explicit same-clock mapping may use the
+/// producer's conditioned clock because both sides share its rate and epoch.
 ///
 /// # Why not `std::time::Instant`?
 ///

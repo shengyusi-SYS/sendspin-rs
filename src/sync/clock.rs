@@ -291,6 +291,8 @@ pub enum ClockUpdateOutcome {
     RejectedInvalidRtt,
     /// `t4` did not strictly advance beyond the last accepted sample.
     RejectedNonMonotonicT4,
+    /// Producer and renderer share a clock; no estimate may replace that mapping.
+    IgnoredSameClock,
 }
 
 /// Why clock health is currently stale.
@@ -304,7 +306,7 @@ pub enum ClockStaleReason {
     SampleExpired,
 }
 
-/// Read-only health derived from the canonical filter and endpoint clock.
+/// Read-only health of the sampled estimate or explicit same-clock mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockHealthSnapshot {
     /// Number of samples applied since construction or reset.
@@ -319,7 +321,7 @@ pub struct ClockHealthSnapshot {
     pub last_rtt_us: Option<i64>,
     /// Whether conversions are currently available and fresh.
     pub synchronized: bool,
-    /// Whether the fresh filter has received its settling sample count.
+    /// Whether corrections can use the mapping (also true for a shared clock).
     pub settled: bool,
     /// Whether conversions are currently rejected for freshness.
     pub stale: bool,
@@ -327,12 +329,14 @@ pub struct ClockHealthSnapshot {
     pub stale_reason: Option<ClockStaleReason>,
     /// Age of the last sample in the endpoint monotonic domain.
     pub sample_age_us: Option<u64>,
-    /// RTT-derived quality, reported as lost while stale.
+    /// RTT-derived quality, or Good for a shared clock; lost while stale.
     pub quality: ClockQuality,
 }
 
 /// Clock synchronization state
 pub struct ClockSync {
+    /// The producer uses this exact clock domain, so no estimate is needed.
+    same_clock: bool,
     /// Last known RTT in microseconds
     rtt_micros: Option<i64>,
     last_valid_t4_us: Option<i64>,
@@ -348,6 +352,7 @@ pub struct ClockSync {
 impl std::fmt::Debug for ClockSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClockSync")
+            .field("same_clock", &self.same_clock)
             .field("rtt_micros", &self.rtt_micros)
             .field("last_valid_t4_us", &self.last_valid_t4_us)
             .field("accepted_samples", &self.accepted_samples)
@@ -359,9 +364,24 @@ impl std::fmt::Debug for ClockSync {
 }
 
 impl ClockSync {
+    /// Use an identical timestamp domain for the producer and renderer.
+    ///
+    /// The caller must supply the clock that generated the audio timestamps
+    /// and scheduled start. Merely running on the same machine is insufficient:
+    /// independently created clocks may have different epochs or tick rates.
+    /// Conversions are exact identities, ready without samples and never
+    /// sample-expired. Updates are ignored; reset retains this mapping.
+    pub fn new_same_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            same_clock: true,
+            ..Self::new(clock)
+        }
+    }
+
     /// Create a new clock synchronization instance with the given clock.
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
+            same_clock: false,
             rtt_micros: None,
             last_valid_t4_us: None,
             accepted_samples: 0,
@@ -387,6 +407,9 @@ impl ClockSync {
     /// - `t3` = server_transmitted (server loop µs)
     /// - `t4` = client_received (raw monotonic µs from [`Clock::now_micros`])
     pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) -> ClockUpdateOutcome {
+        if self.same_clock {
+            return ClockUpdateOutcome::IgnoredSameClock;
+        }
         if self.last_valid_t4_us.is_some_and(|last| t4 <= last) {
             self.rejected_non_monotonic_t4 = self.rejected_non_monotonic_t4.saturating_add(1);
             log::debug!(
@@ -475,6 +498,9 @@ impl ClockSync {
 
     /// Convert server loop microseconds to client clock microseconds
     pub fn server_to_client_micros(&self, server_micros: i64) -> Option<i64> {
+        if self.same_clock {
+            return Some(server_micros);
+        }
         if !self.health().synchronized {
             return None;
         }
@@ -483,6 +509,9 @@ impl ClockSync {
 
     /// Convert client clock microseconds to server loop microseconds
     pub fn client_to_server_micros(&self, client_micros: i64) -> Option<i64> {
+        if self.same_clock {
+            return Some(client_micros);
+        }
         if !self.health().synchronized {
             return None;
         }
@@ -530,6 +559,21 @@ impl ClockSync {
 
     /// Return a deterministic health snapshot using the injected endpoint clock.
     pub fn health(&self) -> ClockHealthSnapshot {
+        if self.same_clock {
+            return ClockHealthSnapshot {
+                accepted_samples: 0,
+                rejected_invalid_rtt: 0,
+                rejected_non_monotonic_t4: 0,
+                last_valid_t4_us: None,
+                last_rtt_us: None,
+                synchronized: true,
+                settled: true,
+                stale: false,
+                stale_reason: None,
+                sample_age_us: None,
+                quality: ClockQuality::Good,
+            };
+        }
         let now_us = self.clock.now_micros();
         let (stale_reason, sample_age_us) = match self.last_valid_t4_us {
             None => (Some(ClockStaleReason::NoSamples), None),
@@ -567,7 +611,7 @@ impl ClockSync {
         }
     }
 
-    /// Clear all filter, quality, sample and readiness state while retaining the endpoint clock.
+    /// Clear sampled state while retaining the clock and same-clock selection.
     pub fn reset(&mut self) {
         self.rtt_micros = None;
         self.last_valid_t4_us = None;
