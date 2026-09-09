@@ -62,6 +62,27 @@ impl GainControl {
         self.state.volume_pct.store(clamped, Ordering::Relaxed);
     }
 
+    /// Set a linear amplitude gain without applying the percentage curve.
+    ///
+    /// For hosts that already own their volume curve. The renderer still uses
+    /// the same gain ramp and mute state. Values are clamped to 0.0-1.0;
+    /// non-finite values become silence. `volume()` reports the nearest
+    /// equivalent perceptual percentage, without quantizing the applied gain.
+    pub fn set_linear_gain(&self, gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.state
+            .target_gain_bits
+            .store(gain.to_bits(), Ordering::Relaxed);
+        self.state.volume_pct.store(
+            (gain.powf(2.0 / 3.0) * 100.0).round() as u8,
+            Ordering::Relaxed,
+        );
+    }
+
     /// Set the mute state. When muted, output gain is 0 regardless of volume.
     pub fn set_mute(&self, muted: bool) {
         log::debug!("Mute set: {muted}");
@@ -262,6 +283,45 @@ impl GainRamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linear_gain_reaches_rendered_samples_without_percentage_quantization() {
+        let control = GainControl::new(100, false);
+        let callback_control = control.clone();
+        let peer = GainControl::new(100, false);
+        let mut ramp = GainRamp::new(1000, callback_control.gain());
+        for gain in [0.3715, 0.0, 0.8264, 1.0] {
+            control.set_linear_gain(gain);
+            let mut samples = [0.5; 48]; // 24 stereo frames exceed the 20-frame ramp.
+            ramp.apply(&mut samples, 2, callback_control.gain());
+            assert_eq!(samples[46], 0.5 * gain);
+            assert_eq!(samples[47], 0.5 * gain);
+            assert_eq!(peer.gain(), 1.0);
+        }
+        control.set_linear_gain(0.3715);
+        control.set_mute(true);
+        assert_eq!(callback_control.gain(), 0.0);
+        control.set_mute(false);
+        assert_eq!(callback_control.gain(), 0.3715);
+        control.set_volume(50);
+        assert!((callback_control.gain() - 0.353_553).abs() < 1e-6);
+    }
+
+    #[test]
+    fn linear_gain_bounds_and_percentage_readback_remain_defined() {
+        let control = GainControl::new(100, false);
+        for (input, expected, percent) in [
+            (-1.0, 0.0, 0),
+            (2.0, 1.0, 100),
+            (0.125, 0.125, 25),
+            (f32::NAN, 0.0, 0),
+            (f32::INFINITY, 0.0, 0),
+        ] {
+            control.set_linear_gain(input);
+            assert_eq!(control.gain(), expected);
+            assert_eq!(control.volume(), percent);
+        }
+    }
 
     // Expected gain values are precomputed literals, NOT calls to `volume_to_gain()`.
     // This is intentional: using the function under test as its own oracle is
