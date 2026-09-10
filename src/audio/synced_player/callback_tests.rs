@@ -157,6 +157,68 @@ impl Harness {
 }
 
 #[test]
+fn callback_access_failure_reports_silence_and_retains_evidence_after_recovery() {
+    for block_renderer in [true, false] {
+        let mut h = Harness::new(44_100);
+        h.warm(OutputTimestampSource::DevicePresentation);
+        let before = h.diagnostics.snapshot();
+        let consumed_before = h.owner.health(h.scope).unwrap().consumed_frames();
+        let owner = h.owner.clone();
+        let queue = h.queue.clone();
+        let permit = block_renderer.then(|| owner.try_callback_permit(h.scope).unwrap());
+        let queue_guard = (!block_renderer).then(|| queue.lock());
+        let callback = StreamInstant::from_nanos(h.now_us * 1_000);
+        let mut data = vec![1.0; 882];
+        (h.callback)(
+            &mut data,
+            OutputStreamTimestamp {
+                callback,
+                playback: callback + Duration::from_micros(167_000),
+            },
+            OutputTimestampSource::DevicePresentation,
+            Some(cpal::OutputTimestampDiagnostics {
+                output_xrun_count: Some(3),
+                output_buffer_size_frames: Some(1024),
+                ..Default::default()
+            }),
+            h.origin + Duration::from_micros(h.now_us),
+        );
+        h.now_us += 10_000;
+        drop(queue_guard);
+        drop(permit);
+
+        assert!(data.iter().all(|sample| *sample == 0.0));
+        let health = h.owner.health(h.scope).unwrap();
+        assert_eq!(health.consumed_frames(), consumed_before);
+        assert_eq!(health.underrun_frames(), 441);
+        let snapshot = h.diagnostics.snapshot();
+        assert_eq!(snapshot.requested_frames - before.requested_frames, 441);
+        assert_eq!(snapshot.silent_callbacks - before.silent_callbacks, 1);
+        assert_eq!(snapshot.silent_frames - before.silent_frames, 441);
+        assert_eq!(snapshot.access_silence_frames, 441);
+        assert_eq!(snapshot.renderer_access_misses, u64::from(block_renderer));
+        assert_eq!(snapshot.queue_lock_misses, u64::from(!block_renderer));
+        assert_eq!(snapshot.last_access_miss_callback, before.callbacks + 1);
+        assert_eq!(snapshot.last_access_miss_phase, Some("timing_snapshot"));
+        assert_eq!(snapshot.underrun_frames, 0); // This queue never ran dry.
+        assert_eq!(snapshot.output_xrun_count, Some(3));
+        assert_eq!(snapshot.output_buffer_size_frames, Some(1024));
+        assert_eq!(snapshot.raw_error_us, None);
+
+        let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        assert!(data.iter().all(|sample| *sample > 0.0));
+        assert_eq!(consumed, 441);
+        let recovered = h.diagnostics.snapshot();
+        assert_eq!(recovered.access_silence_frames, 441);
+        assert_eq!(recovered.last_access_miss_callback, snapshot.callbacks);
+        assert_eq!(recovered.last_access_miss_phase, Some("timing_snapshot"));
+        assert_eq!(recovered.silent_frames, snapshot.silent_frames);
+        assert_eq!(recovered.output_xrun_count, None); // Unsupported is not zero.
+        assert_eq!(recovered.output_buffer_size_frames, None);
+    }
+}
+
+#[test]
 fn callback_valid_and_unspecified_timestamps_start_and_remain_aligned() {
     for rate in [44_100, 96_000] {
         for source in [

@@ -15,6 +15,28 @@ pub struct SyncDiagnosticsSnapshot {
     pub captured_at: Option<Instant>,
     /// All callbacks, including silent and contended callbacks.
     pub callbacks: u64,
+    /// All frames requested by callbacks, including startup and silence.
+    pub requested_frames: u64,
+    /// Callbacks which emitted a whole buffer of silence instead of rendering.
+    /// Includes intentional pre-start silence; excludes partial queue starvation.
+    pub silent_callbacks: u64,
+    /// Frames in those whole-buffer silent callbacks.
+    pub silent_frames: u64,
+    /// Renderer permit unavailable: contention or a closed/stale scope.
+    pub renderer_access_misses: u64,
+    /// Playback queue try_lock failures after acquiring a renderer permit.
+    pub queue_lock_misses: u64,
+    /// Silent frames caused by either queue-access guard failing.
+    pub access_silence_frames: u64,
+    /// Sequence of the most recent queue-access failure, retained across recovery.
+    pub last_access_miss_callback: u64,
+    /// Static phase label of that failure, absent before the first failure.
+    pub last_access_miss_phase: Option<&'static str>,
+    /// Backend underrun count before the latest callback, None when unavailable.
+    /// Independent from application silence and queue-starvation counters.
+    pub output_xrun_count: Option<u32>,
+    /// Backend output buffer size observed before the latest callback.
+    pub output_buffer_size_frames: Option<u32>,
     /// Playback queue generation observed by this callback.
     pub generation: u64,
     /// Configured output sample rate.
@@ -131,6 +153,9 @@ mod tests {
         let snapshot = SyncDiagnosticsSnapshot {
             callbacks: 7,
             correction_reanchors: 2,
+            access_silence_frames: 441,
+            last_access_miss_callback: 7,
+            last_access_miss_phase: Some("render"),
             last_reanchor_error_us: Some(510_000),
             ..Default::default()
         };
@@ -143,6 +168,9 @@ mod tests {
             ..snapshot
         });
         assert_eq!(reader.snapshot().correction_reanchors, 2);
+        assert_eq!(reader.snapshot().access_silence_frames, 441);
+        assert_eq!(reader.snapshot().last_access_miss_callback, 7);
+        assert_eq!(reader.snapshot().last_access_miss_phase, Some("render"));
         assert_eq!(reader.snapshot().last_reanchor_error_us, Some(510_000));
         reader.publish(SyncDiagnosticsSnapshot {
             callbacks: 9,

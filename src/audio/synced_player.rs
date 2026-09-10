@@ -651,6 +651,17 @@ enum CallbackQueuePhase {
     Render,
 }
 
+impl CallbackQueuePhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TimingSnapshot => "timing_snapshot",
+            Self::StartupReanchor => "startup_reanchor",
+            Self::CorrectionReanchor => "correction_reanchor",
+            Self::Render => "render",
+        }
+    }
+}
+
 enum StartupReanchorOutcome {
     Applied(i64),
     NoPlayable,
@@ -662,11 +673,12 @@ fn try_callback_queue<T>(
     scope: PlayerScope,
     queue: &Mutex<PlaybackQueue>,
     silent_frames: usize,
-    _phase: CallbackQueuePhase,
+    phase: CallbackQueuePhase,
+    observation: &mut SyncDiagnosticsSnapshot,
     operation: impl FnOnce(&mut PlaybackQueue, &mut RendererCallbackPermit<'_>) -> T,
 ) -> Option<T> {
     let (mut permit, mut queue) =
-        try_callback_queue_guards(renderer, scope, queue, silent_frames, _phase)?;
+        try_callback_queue_guards(renderer, scope, queue, silent_frames, phase, observation)?;
     Some(operation(&mut queue, &mut permit))
 }
 
@@ -675,15 +687,30 @@ fn try_callback_queue_guards<'a>(
     scope: PlayerScope,
     queue: &'a Mutex<PlaybackQueue>,
     silent_frames: usize,
-    _phase: CallbackQueuePhase,
+    phase: CallbackQueuePhase,
+    observation: &mut SyncDiagnosticsSnapshot,
 ) -> Option<(RendererCallbackPermit<'a>, MutexGuard<'a, PlaybackQueue>)> {
-    let Some(permit) = renderer.try_callback_permit(scope) else {
+    let mut record_failure = |renderer_unavailable: bool| {
+        let counter = if renderer_unavailable {
+            &mut observation.renderer_access_misses
+        } else {
+            &mut observation.queue_lock_misses
+        };
+        *counter = counter.saturating_add(1);
+        observation.access_silence_frames = observation
+            .access_silence_frames
+            .saturating_add(silent_frames as u64);
+        observation.last_access_miss_callback = observation.callbacks;
+        observation.last_access_miss_phase = Some(phase.label());
         renderer.record_callback_underrun(silent_frames as u64);
+    };
+    let Some(permit) = renderer.try_callback_permit(scope) else {
+        record_failure(true);
         return None;
     };
     let Some(queue) = queue.try_lock() else {
         drop(permit);
-        renderer.record_callback_underrun(silent_frames as u64);
+        record_failure(false);
         return None;
     };
     Some((permit, queue))
@@ -1330,7 +1357,13 @@ fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
     let mut f32_buffer = Vec::<f32>::new();
     move |data: &mut [T], timestamp, timestamp_source, timestamp_diagnostics, captured_at| {
         observation.callbacks = observation.callbacks.saturating_add(1);
+        observation.requested_frames = observation
+            .requested_frames
+            .saturating_add((data.len() / channels) as u64);
         observation.captured_at = Some(captured_at);
+        observation.output_xrun_count = timestamp_diagnostics.and_then(|d| d.output_xrun_count);
+        observation.output_buffer_size_frames =
+            timestamp_diagnostics.and_then(|d| d.output_buffer_size_frames);
         if timestamp_source == cpal::OutputTimestampSource::MonotonicFallback {
             if let Some(evidence) = timestamp_diagnostics {
                 if let Some(reason) = evidence.fallback_reason {
@@ -1365,6 +1398,7 @@ fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
         previous_callback_at = Some(captured_at);
         // Keep all early returns inside the render operation, so
         // silence and contention still publish a fresh observation.
+        let mut callback_silenced = false;
         let mut render_callback = || {
             let mut process_output = |data: &mut [T], buffer: &mut Vec<f32>| {
                 if let Some(ref mut cb) = cb_config.process_callback {
@@ -1379,6 +1413,7 @@ fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
             // Advance the gain ramp even while silent so the first real
             // audio resumes at the target gain with no fade-in.
             let mut emit_silence = |data: &mut [T]| {
+                callback_silenced = true;
                 let target = cb_config.gain_control.gain();
                 gain_ramp.advance(data.len() / channels, target);
                 f32_buffer.clear();
@@ -1424,6 +1459,7 @@ fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
                 &queue,
                 frames,
                 CallbackQueuePhase::TimingSnapshot,
+                &mut observation,
                 |queue, permit| {
                     let cursor = if queue.initialized {
                         Some(queue.cursor_us)
@@ -1620,6 +1656,7 @@ fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
                             &queue,
                             frames,
                             CallbackQueuePhase::StartupReanchor,
+                            &mut observation,
                             |queue, _permit| {
                                 if queue.generation != generation || !queue.initialized {
                                     return StartupReanchorOutcome::Stale;
@@ -1873,6 +1910,7 @@ fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
                                     &queue,
                                     frames,
                                     CallbackQueuePhase::CorrectionReanchor,
+                                    &mut observation,
                                     |queue, _permit| {
                                         queue.cursor_us = server_time;
                                         queue.cursor_remainder = 0;
@@ -1945,6 +1983,7 @@ fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
                 &queue,
                 frames,
                 CallbackQueuePhase::Render,
+                &mut observation,
             ) else {
                 emit_silence(data);
                 return;
@@ -2171,6 +2210,12 @@ fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
             }
         };
         render_callback();
+        if callback_silenced {
+            observation.silent_callbacks = observation.silent_callbacks.saturating_add(1);
+            observation.silent_frames = observation
+                .silent_frames
+                .saturating_add(observation.callback_frames as u64);
+        }
         diagnostics.publish(observation);
     }
 }
@@ -2191,7 +2236,8 @@ mod tests {
         abort_before_start_with_queue, canonical_presentation_zone_us, classify_output_timestamp,
         default_renderer_limits, set_device_delay_state, teardown_with_queue, try_callback_queue,
         validate_enqueue_buffer, validate_output_format, windows_default_buffer_frames,
-        CallbackQueuePhase, DeviceDelayError, DeviceDelayMs, PlaybackQueue, MAX_STATIC_DELAY_MS,
+        CallbackQueuePhase, DeviceDelayError, DeviceDelayMs, PlaybackQueue,
+        SyncDiagnosticsSnapshot, MAX_STATIC_DELAY_MS,
     };
     use crate::audio::{
         AudioBuffer, AudioFormat, Codec, EnqueueOutcome, PlayerScope, PreStartAbortOutcome,
@@ -2377,6 +2423,7 @@ mod tests {
     #[test]
     fn open_scope_queue_contention_silence_is_observable() {
         let (owner, scope, queue) = renderer_harness();
+        let mut observation = SyncDiagnosticsSnapshot::default();
         let queue_guard = queue.lock();
         for phase in [
             CallbackQueuePhase::TimingSnapshot,
@@ -2384,10 +2431,17 @@ mod tests {
             CallbackQueuePhase::CorrectionReanchor,
             CallbackQueuePhase::Render,
         ] {
+            observation.callbacks += 1;
             assert!(owner.try_callback_heartbeat(scope));
-            assert!(try_callback_queue(&owner, scope, &queue, 6, phase, |_, _| {
-                unreachable!("contended queue must not run callback operation")
-            })
+            assert!(try_callback_queue(
+                &owner,
+                scope,
+                &queue,
+                6,
+                phase,
+                &mut observation,
+                |_, _| { unreachable!("contended queue must not run callback operation") }
+            )
             .is_none());
         }
         drop(queue_guard);
@@ -2395,6 +2449,11 @@ mod tests {
         let health = owner.health(scope).unwrap();
         assert_eq!(health.callback_count(), 4);
         assert_eq!(health.underrun_frames(), 24);
+        assert_eq!(observation.queue_lock_misses, 4);
+        assert_eq!(observation.renderer_access_misses, 0);
+        assert_eq!(observation.access_silence_frames, 24);
+        assert_eq!(observation.last_access_miss_callback, 4);
+        assert_eq!(observation.last_access_miss_phase, Some("render"));
         assert_eq!(health.consumed_frames(), 0);
     }
 
@@ -2423,6 +2482,7 @@ mod tests {
             &queue,
             1,
             CallbackQueuePhase::Render,
+            &mut SyncDiagnosticsSnapshot::default(),
             |queue, permit| {
                 let decision = permit.scheduled_start(Some(99));
                 (decision, queue.queued_frames(1), queue.buffer_count())
@@ -2451,6 +2511,7 @@ mod tests {
             &queue,
             1,
             CallbackQueuePhase::Render,
+            &mut SyncDiagnosticsSnapshot::default(),
             |queue, permit| {
                 let decision = permit.scheduled_start(Some(100));
                 assert!(queue.next_frame(1, 48_000).is_some());
@@ -2478,6 +2539,7 @@ mod tests {
             &queue,
             1,
             CallbackQueuePhase::Render,
+            &mut SyncDiagnosticsSnapshot::default(),
             |queue, permit| {
                 let decision = permit.scheduled_start(None);
                 assert!(queue.next_frame(1, 48_000).is_some());
@@ -2551,6 +2613,7 @@ mod tests {
             &queue,
             1,
             CallbackQueuePhase::Render,
+            &mut SyncDiagnosticsSnapshot::default(),
             |queue, permit| {
                 let outcome = permit.scheduled_start(before);
                 (outcome, queue.queued_frames(1), queue.buffer_count())
@@ -2575,6 +2638,7 @@ mod tests {
             &queue,
             1,
             CallbackQueuePhase::Render,
+            &mut SyncDiagnosticsSnapshot::default(),
             |queue, permit| {
                 let outcome = permit.scheduled_start(at_boundary);
                 assert!(queue.next_frame(1, 48_000).is_some());
@@ -2613,6 +2677,7 @@ mod tests {
             &queue,
             1,
             CallbackQueuePhase::TimingSnapshot,
+            &mut SyncDiagnosticsSnapshot::default(),
             |_queue, permit| permit.start_state(),
         )
         .unwrap();
@@ -2627,6 +2692,7 @@ mod tests {
             &queue,
             1,
             CallbackQueuePhase::Render,
+            &mut SyncDiagnosticsSnapshot::default(),
             |_queue, permit| permit.scheduled_start(Some(100)),
         )
         .unwrap();
@@ -2654,6 +2720,7 @@ mod tests {
             &queue,
             1,
             CallbackQueuePhase::TimingSnapshot,
+            &mut SyncDiagnosticsSnapshot::default(),
             |_queue, permit| permit.start_state(),
         )
         .unwrap();
@@ -2676,6 +2743,7 @@ mod tests {
             &queue,
             1,
             CallbackQueuePhase::Render,
+            &mut SyncDiagnosticsSnapshot::default(),
             |_queue, permit| permit.scheduled_start(Some(200)),
         )
         .unwrap();
