@@ -1233,6 +1233,33 @@ impl RendererOwner {
         })
     }
 
+    /// Hint for host-side terminal polling; confirm a positive result with health().
+    /// Reads only existing scope/close atomics. This is not a terminal acknowledgement.
+    pub fn needs_terminal_check(&self, scope: PlayerScope) -> bool {
+        self.shared.active_scope.load(Ordering::Acquire) != scope.id
+            || self.shared.callback_state.load(Ordering::Acquire) & CALLBACK_CLOSED != 0
+    }
+
+    /// Best-effort diagnostic snapshot. Contention may skip this observation.
+    /// Does not wait for the renderer or retry an in-flight telemetry write.
+    /// Use health() for authoritative consumption and finalization reads.
+    pub fn try_health(
+        &self,
+        scope: PlayerScope,
+    ) -> Result<Option<RendererHealthSnapshot>, RendererOperationOutcome> {
+        let Some(owner) = self.shared.state.try_lock() else {
+            return Ok(None);
+        };
+        let state = owner
+            .current
+            .as_ref()
+            .filter(|state| state.scope == scope)
+            .ok_or(RendererOperationOutcome::StaleScope)?;
+        Ok(self
+            .try_callback_telemetry_snapshot()
+            .map(|telemetry| self.health_snapshot(state, telemetry)))
+    }
+
     /// Read the current scope's complete typed health snapshot.
     pub fn health(
         &self,
@@ -1245,9 +1272,16 @@ impl RendererOwner {
         if state.scope != scope {
             return Err(RendererOperationOutcome::StaleScope);
         }
-        let (callback_count, output_timestamps) = self.callback_telemetry_snapshot();
-        Ok(RendererHealthSnapshot {
-            scope,
+        Ok(self.health_snapshot(state, self.callback_telemetry_snapshot()))
+    }
+
+    fn health_snapshot(
+        &self,
+        state: &ScopeState,
+        (callback_count, output_timestamps): (u64, OutputTimestampEvidenceSnapshot),
+    ) -> RendererHealthSnapshot {
+        RendererHealthSnapshot {
+            scope: state.scope,
             queued_frames: state.queued_frames,
             queued_buffers: state.queued_buffers,
             limits: self.limits,
@@ -1258,50 +1292,54 @@ impl RendererOwner {
             last_presentation_boundary_zone_us: state.last_boundary,
             fault: state.fault,
             terminal: state.terminal,
-        })
+        }
     }
 
     fn callback_telemetry_snapshot(&self) -> (u64, OutputTimestampEvidenceSnapshot) {
-        // Owner-side seqlock read. A callback never waits for this reader; the
-        // reader retries if a writer overlaps the atomic snapshot.
+        // Authoritative readers preserve the existing coherent telemetry contract.
+        // Background diagnostics use the single-attempt variant instead.
         loop {
-            let before = self
-                .shared
-                .timestamp_telemetry_state
-                .load(Ordering::Acquire);
-            if before & TIMESTAMP_TELEMETRY_VERSION_MASK & 1 != 0 {
-                #[cfg(test)]
-                self.shared
-                    .timestamp_snapshot_retries
-                    .fetch_add(1, Ordering::Release);
-                std::thread::yield_now();
-                continue;
+            if let Some(snapshot) = self.try_callback_telemetry_snapshot() {
+                return snapshot;
             }
-            let callback_count =
-                self.shared.callback_state.load(Ordering::Acquire) & CALLBACK_COUNT_MASK;
-            let output_timestamps = OutputTimestampEvidenceSnapshot {
-                device_presentation: self
-                    .shared
-                    .device_presentation_timestamps
-                    .load(Ordering::Acquire),
-                monotonic_fallback: self
-                    .shared
-                    .monotonic_fallback_timestamps
-                    .load(Ordering::Acquire),
-                unspecified: self.shared.unspecified_timestamps.load(Ordering::Acquire),
-                monotonic_violations: self
-                    .shared
-                    .timestamp_monotonic_violations
-                    .load(Ordering::Acquire),
-            };
-            let after = self
-                .shared
-                .timestamp_telemetry_state
-                .load(Ordering::Acquire);
-            if before == after {
-                return (callback_count, output_timestamps);
-            }
+            #[cfg(test)]
+            self.shared
+                .timestamp_snapshot_retries
+                .fetch_add(1, Ordering::Release);
+            std::thread::yield_now();
         }
+    }
+
+    fn try_callback_telemetry_snapshot(&self) -> Option<(u64, OutputTimestampEvidenceSnapshot)> {
+        let before = self
+            .shared
+            .timestamp_telemetry_state
+            .load(Ordering::Acquire);
+        if before & TIMESTAMP_TELEMETRY_VERSION_MASK & 1 != 0 {
+            return None;
+        }
+        let callback_count =
+            self.shared.callback_state.load(Ordering::Acquire) & CALLBACK_COUNT_MASK;
+        let output_timestamps = OutputTimestampEvidenceSnapshot {
+            device_presentation: self
+                .shared
+                .device_presentation_timestamps
+                .load(Ordering::Acquire),
+            monotonic_fallback: self
+                .shared
+                .monotonic_fallback_timestamps
+                .load(Ordering::Acquire),
+            unspecified: self.shared.unspecified_timestamps.load(Ordering::Acquire),
+            monotonic_violations: self
+                .shared
+                .timestamp_monotonic_violations
+                .load(Ordering::Acquire),
+        };
+        let after = self
+            .shared
+            .timestamp_telemetry_state
+            .load(Ordering::Acquire);
+        (before == after).then_some((callback_count, output_timestamps))
     }
 
     /// Read the shared terminal state for the current scope.
@@ -2277,6 +2315,48 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(owner.health(scope).unwrap(), final_health);
+    }
+
+    #[test]
+    fn diagnostic_health_skips_inflight_telemetry_without_holding_renderer() {
+        let (owner, scope) = owner_and_scope();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = {
+            let owner = owner.clone();
+            thread::spawn(move || {
+                owner.try_callback_telemetry_with(
+                    scope,
+                    cpal::OutputTimestampSource::DevicePresentation,
+                    false,
+                    || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let reader = {
+            let owner = owner.clone();
+            thread::spawn(move || tx.send(owner.try_health(scope)).unwrap())
+        };
+        let observed = rx.recv_timeout(std::time::Duration::from_secs(1));
+        let renderer_available = owner.try_callback_permit(scope).is_some();
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap());
+        reader.join().unwrap();
+        assert_eq!(
+            observed
+                .expect("diagnostic read must not wait for telemetry")
+                .unwrap(),
+            None
+        );
+        assert!(renderer_available);
+        let health = owner.try_health(scope).unwrap().unwrap();
+        assert_eq!(health.callback_count(), 1);
+        assert_eq!(health.output_timestamps().device_presentation(), 1);
     }
 
     #[test]

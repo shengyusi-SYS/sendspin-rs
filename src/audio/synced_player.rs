@@ -986,7 +986,6 @@ impl SyncedPlayer {
             queue.enqueue_count += 1;
             (queue.queued_frames(channels), queue.buffer_count())
         });
-        drop(queue);
         if !matches!(outcome, EnqueueOutcome::Accepted { .. }) {
             return outcome;
         }
@@ -996,7 +995,6 @@ impl SyncedPlayer {
         // The O(buffers) depth walk runs only for sampled, trace-enabled
         // enqueues.
         let trace_fields = {
-            let queue = self.queue.lock();
             if log::log_enabled!(log::Level::Trace) && should_log_sample(queue.enqueue_count) {
                 Some((
                     queue.enqueue_count,
@@ -1009,6 +1007,7 @@ impl SyncedPlayer {
                 None
             }
         };
+        drop(queue);
 
         if let Some((enqueue_count, queued_us, buffers, cursor_us, generation)) = trace_fields {
             log::trace!(

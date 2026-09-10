@@ -157,6 +157,43 @@ impl Harness {
 }
 
 #[test]
+fn callback_continues_after_contended_diagnostic_read_is_skipped() {
+    let mut h = Harness::new(44_100);
+    h.warm(OutputTimestampSource::DevicePresentation);
+    let owner = h.owner.clone();
+    let scope = h.scope;
+    let permit = owner.try_callback_permit(scope).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = {
+        let owner = owner.clone();
+        std::thread::spawn(move || {
+            tx.send((owner.needs_terminal_check(scope), owner.try_health(scope)))
+                .unwrap();
+        })
+    };
+    // The channel observes completion while playback state is unavailable.
+    // Timeout is only a failure guard; release and join even on regression.
+    let observed = rx.recv_timeout(Duration::from_secs(1));
+    drop(permit);
+    reader.join().unwrap();
+    let (needs_check, health) = observed.expect("diagnostics must not wait for playback state");
+    assert!(!needs_check);
+    assert_eq!(health.unwrap(), None);
+    let before = h.diagnostics.snapshot();
+    let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    assert!(data.iter().all(|sample| *sample > 0.0));
+    assert_eq!(consumed, 441);
+    assert_eq!(
+        h.diagnostics.snapshot().access_silence_frames,
+        before.access_silence_frames
+    );
+    assert!(owner.try_health(scope).unwrap().is_some());
+    assert_eq!(owner.close(scope), RendererOperationOutcome::Applied);
+    assert!(owner.needs_terminal_check(scope));
+    assert!(owner.health(scope).unwrap().terminal().is_some());
+}
+
+#[test]
 fn callback_access_failure_reports_silence_and_retains_evidence_after_recovery() {
     for block_renderer in [true, false] {
         let mut h = Harness::new(44_100);
