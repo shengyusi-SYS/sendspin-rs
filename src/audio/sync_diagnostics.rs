@@ -29,9 +29,23 @@ pub struct SyncDiagnosticsSnapshot {
     pub raw_error_us: Option<i64>,
     /// Filtered error for that same callback.
     pub filtered_error_us: Option<i64>,
-    /// Active repeat-frame cadence, zero when inactive.
+    /// Cumulative timestamp query/rejection counts, including silent callbacks.
+    pub fallback_unavailable: u64,
+    /// Queries unsupported by the host.
+    pub fallback_unsupported: u64,
+    /// Invalid or already elapsed presentation projections.
+    pub fallback_invalid: u64,
+    /// Projections which did not advance past the last accepted presentation.
+    pub fallback_non_monotonic: u64,
+    /// Queries from an incompatible clock domain.
+    pub fallback_clock_domain_mismatch: u64,
+    /// Callback sequence of the latest detailed fallback, retained across valid callbacks.
+    pub last_timestamp_fallback_callback: u64,
+    /// Latest fallback evidence, retained so a slow logger does not miss short events.
+    pub last_timestamp_fallback: Option<cpal::OutputTimestampDiagnostics>,
+    /// Applied repeat-frame cadence for this callback, zero when inactive.
     pub insert_every: u32,
-    /// Active drop-frame cadence, zero when inactive.
+    /// Applied drop-frame cadence for this callback, zero when inactive.
     pub drop_every: u32,
     /// Frames actually repeated by the corrector.
     pub inserted_frames: u64,

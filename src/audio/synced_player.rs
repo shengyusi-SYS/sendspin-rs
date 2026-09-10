@@ -1185,7 +1185,7 @@ impl SyncedPlayer {
         queue: Arc<Mutex<PlaybackQueue>>,
         clock_sync: Arc<Mutex<ClockSync>>,
         format: AudioFormat,
-        mut cb_config: CallbackConfig,
+        cb_config: CallbackConfig,
         outputs: CallbackOutputs,
         diagnostics: SyncDiagnosticsReader,
     ) -> Result<Stream, Error> {
@@ -1194,39 +1194,6 @@ impl SyncedPlayer {
             renderer,
             scope,
         } = outputs;
-        let channels = format.channels as usize;
-        let sample_rate = format.sample_rate;
-        let planner = CorrectionPlanner::new();
-        let mut error_filter = SyncErrorFilter::new();
-        let mut engage_gate = EngageGate::new();
-        let mut last_frame = vec![i32::EQUILIBRIUM; channels];
-        let mut schedule = CorrectionSchedule::default();
-        let mut insert_counter = 0u32;
-        let mut drop_counter = 0u32;
-        let mut started = false;
-        let mut handoff_warned = false;
-        let mut sync_settle_logged = false;
-        let mut last_callback_instant: Option<Instant> = None;
-        let mut last_playback_timestamp: Option<cpal::StreamInstant> = None;
-        let mut last_playback_delta_us: Option<u64> = None;
-        // Running minimum of the presentation-latency snapshot, reset per
-        // generation. Reanchors anchor against this floor rather than one
-        // wake's reading: padding noise is one-sided (see SyncErrorFilter),
-        // so a single sample may run a whole period high, and anchoring to it
-        // bakes that period into the timeline until corrections audibly
-        // unwind it. A stale floor after a latency-regime shift costs at most
-        // one period of realignment — no worse than the shift itself.
-        let mut min_playback_delta_us = u64::MAX;
-        let mut last_generation = 0u64;
-        let mut stats = CallbackStats::default();
-        let mut observation = SyncDiagnosticsSnapshot {
-            sample_rate,
-            ..Default::default()
-        };
-        let mut previous_callback_at: Option<Instant> = None;
-        let initial_gain = cb_config.gain_control.gain();
-        let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
-        let mut f32_buffer = Vec::<f32>::new();
         let device_config = device
             .default_output_config()
             .map_err(|e| Error::Output(e.to_string()))?;
@@ -1237,850 +1204,48 @@ impl SyncedPlayer {
 
         macro_rules! output_stream {
             ($sample:ty) => {{
-                let renderer_for_data = renderer.clone();
                 let renderer_for_error = renderer.clone();
-                device.build_output_stream(
-                    stream_config,
-                    move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
-                    let captured_at = Instant::now();
-                    observation.callbacks = observation.callbacks.saturating_add(1);
-                    observation.captured_at = Some(captured_at);
-                    observation.callback_frames = data.len() / channels;
-                    observation.raw_error_us = None;
-                    observation.filtered_error_us = None;
-                    observation.playback_delay_us = info.timestamp().playback.duration_since(info.timestamp().callback).as_micros() as u64;
-                    if let Some(previous) = previous_callback_at {
-                        observation.max_callback_gap_us = observation.max_callback_gap_us.max(captured_at.duration_since(previous).as_micros() as u64);
-                    }
-                    previous_callback_at = Some(captured_at);
-                    // Keep all early returns inside the render operation, so
-                    // silence and contention still publish a fresh observation.
-                    let mut render_callback = || {
-                    let mut process_output = |data: &mut [$sample], buffer: &mut Vec<f32>| {
-                        if let Some(ref mut cb) = cb_config.process_callback {
-                            cb(buffer);
-                        }
-
-                        for (dst, &sample) in data.iter_mut().zip(buffer.iter()) {
-                            *dst = <$sample>::from_sample(sample);
-                        }
-                    };
-
-                    // Advance the gain ramp even while silent so the first real
-                    // audio resumes at the target gain with no fade-in.
-                    let mut emit_silence = |data: &mut [$sample]| {
-                        let target = cb_config.gain_control.gain();
-                        gain_ramp.advance(data.len() / channels, target);
-                        f32_buffer.clear();
-                        f32_buffer.resize(data.len(), 0.0);
-                        process_output(data, &mut f32_buffer);
-                    };
-
-                    // Snapshot the level checks once per callback. At info level
-                    // these two loads are the only per-callback logging cost.
-                    let debug_logging = log::log_enabled!(log::Level::Debug);
-                    let trace_logging = log::log_enabled!(log::Level::Trace);
-
-                    let timestamp = info.timestamp();
-                    let timestamp_source = info.timestamp_source();
-                    let timestamp_observation = classify_output_timestamp(
-                        timestamp,
-                        timestamp_source,
-                        last_playback_timestamp,
-                    );
-                    if !renderer_for_data.try_callback_telemetry(
-                        scope,
-                        timestamp_observation.source,
-                        timestamp_observation.monotonic_violation,
-                    ) {
-                        emit_silence(data);
-                        return;
-                    }
-                    last_playback_timestamp = Some(timestamp_observation.timestamp.playback);
-
-                    stats.callbacks += 1;
-                    let frames = data.len() / channels;
-
-                    // Read queue timing state together. The generation is
-                    // rechecked before consuming force_reanchor so a clear()
-                    // racing with this callback cannot clear the next startup's
-                    // one-shot handoff.
-                    let Some((
-                        start_state,
-                        generation,
-                        cursor_us,
-                        force_reanchor,
-                        delay_us,
-                        queued_us,
-                        queued_buffers,
-                    )) = try_callback_queue(
-                            &renderer_for_data,
-                            scope,
-                            &queue,
-                            frames,
-                            CallbackQueuePhase::TimingSnapshot,
-                            |queue, permit| {
-                        let cursor = if queue.initialized {
-                            Some(queue.cursor_us)
-                        } else {
-                            None
-                        };
-                        // Queue depth costs a walk over every queued buffer,
-                        // so only measure it when a log line below can print
-                        // it.
-                        let (queued_us, queued_buffers) = if debug_logging {
-                            (
-                                queue.queued_duration_us(channels, sample_rate),
-                                queue.buffer_count(),
-                            )
-                        } else {
-                            (0, 0)
-                        };
-                        (
-                            permit.start_state(),
-                            queue.generation,
-                            cursor,
-                            queue.force_reanchor,
-                            cb_config.static_delay_us.load(Ordering::Relaxed),
-                            queued_us,
-                            queued_buffers,
-                        )
-                            },
-                        )
-                    else {
-                        emit_silence(data);
-                        return;
-                    };
-                    // This first branch is an advisory snapshot only. Public
-                    // arm/clear operations may legally change the state before
-                    // the render permit is acquired below, so the render permit
-                    // remains the sole authority for the transition decision.
-                    match start_state {
-                        StartState::Idle
-                        | StartState::Armed { .. }
-                        | StartState::BoundaryWon { .. } => {}
-                    }
-                    observation.generation = generation;
-                    if generation != last_generation {
-                        log::debug!(
-                            "Playback queue generation changed: {} -> {}, queued={:.1}ms, buffers={}, callbacks={}, silent_callbacks={}, underrun_callbacks={}, underrun_frames={}, sync_lock_misses={}, correction_engagements={}",
-                            last_generation,
-                            generation,
-                            us_to_ms(queued_us),
-                            queued_buffers,
-                            stats.callbacks,
-                            stats.silent_callbacks,
-                            stats.underrun_callbacks,
-                            stats.underrun_frames,
-                            stats.sync_lock_misses,
-                            stats.correction_engagements,
-                        );
-                        last_generation = generation;
-                        started = false;
-                        schedule = CorrectionSchedule::default();
-                        insert_counter = 0;
-                        drop_counter = 0;
-                        error_filter.reset();
-                        engage_gate.reset();
-                        min_playback_delta_us = u64::MAX;
-                        stats.reset_for_generation();
-                        for sample in last_frame.iter_mut() {
-                            *sample = i32::EQUILIBRIUM;
-                        }
-                        handoff_warned = false;
-                    }
-
-                    let callback_instant = Instant::now();
-                    let ts = timestamp_observation.timestamp;
-                    let playback_delta = ts.playback.duration_since(ts.callback);
-                    let playback_instant = callback_instant + playback_delta;
-                    let mut presentation_zone_us = None;
-
-                    // Both values are normally steady, so a step in either
-                    // explains a sync-error step: a callback gap means this
-                    // thread stalled; a playback-delta shift means the OS
-                    // moved the presentation timeline.
-                    let playback_delta_us = playback_delta.as_micros() as u64;
-                    if let Some(last) = last_callback_instant {
-                        let gap_us = callback_instant.duration_since(last).as_micros() as u64;
-                        let period_us = frames as u64 * 1_000_000 / u64::from(sample_rate.max(1));
-                        if gap_us >= 2 * period_us {
-                            log::debug!(
-                                "Audio callback gap: {:.1}ms since previous (period ~{:.1}ms), callback={}, generation={}",
-                                us_to_ms(gap_us),
-                                us_to_ms(period_us),
-                                stats.callbacks,
-                                generation,
+                let mut callback = make_output_callback::<$sample>(
+                    queue,
+                    clock_sync,
+                    format,
+                    cb_config,
+                    renderer,
+                    scope,
+                    diagnostics,
+                );
+                device
+                    .build_output_stream(
+                        stream_config,
+                        move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
+                            callback(
+                                data,
+                                info.timestamp(),
+                                info.timestamp_source(),
+                                info.timestamp_diagnostics(),
+                                Instant::now(),
                             );
-                        }
-                    }
-                    last_callback_instant = Some(callback_instant);
-                    if let Some(last) = last_playback_delta_us {
-                        if playback_delta_us.abs_diff(last) > 1_000 {
-                            log::debug!(
-                                "Output timeline shifted: playback_delta {:.1}ms -> {:.1}ms, callback={}, generation={}",
-                                us_to_ms(last),
-                                us_to_ms(playback_delta_us),
-                                stats.callbacks,
-                                generation,
-                            );
-                        }
-                    }
-                    last_playback_delta_us = Some(playback_delta_us);
-                    min_playback_delta_us = min_playback_delta_us.min(playback_delta_us);
-
-                    // try_lock: skip sync if contended rather than blocking
-                    // the audio thread. force_reanchor is sticky in the
-                    // queue, so it will be retried on the next callback.
-                    let sync = clock_sync.try_lock();
-                    if cursor_us.is_some() && sync.is_none() {
-                        // Count lock contention only once playback has an
-                        // initialized cursor; before that there is no timeline
-                        // position to synchronize yet.
-                        stats.sync_lock_misses += 1;
-                        observation.sync_lock_misses = observation.sync_lock_misses.saturating_add(1);
-                        if trace_logging && should_log_sample(stats.sync_lock_misses) {
-                            log::trace!(
-                                "Audio callback skipped sync: clock lock contended, callback={}, sync_lock_miss={}, queued={:.1}ms, buffers={}, started={}",
-                                stats.callbacks,
-                                stats.sync_lock_misses,
-                                us_to_ms(queued_us),
-                                queued_buffers,
-                                started,
-                            );
-                        }
-                    }
-                    if let (Some(cursor_us), Some(sync)) = (cursor_us, sync) {
-                        presentation_zone_us = canonical_presentation_zone_us(
-                            sync.client_to_server_micros(
-                                sync.instant_to_client_micros(playback_instant),
-                            ),
-                            delay_us,
-                        );
-                        // Emit each sample `delay` earlier so downstream
-                        // (amp/speaker) latency lands it on time. The reanchor
-                        // below adds the same delay in the local→server
-                        // direction; the two signs must stay in step or the
-                        // planner chases a phantom error every callback.
-                        let mut effective_cursor_us = cursor_us;
-                        let sync_settled = sync.is_settled();
-                        if sync_settled && !sync_settle_logged {
-                            sync_settle_logged = true;
-                            // Warm-up measurements track the converging clock
-                            // estimate, not playback; start the filter fresh.
-                            error_filter.reset();
-                            engage_gate.reset();
-                            log::debug!(
-                                "Clock sync settled; corrections enabled: callback={}, suppressed_during_warmup={}, generation={}",
-                                stats.callbacks,
-                                stats.warmup_suppressed_corrections,
-                                generation,
-                            );
-                        }
-
-                        if force_reanchor {
-                            let mut reanchor_applied = false;
-                            // Anchor from the delta floor, not this wake's
-                            // reading (see min_playback_delta_us above). The
-                            // floor already includes this callback's sample,
-                            // so it is never u64::MAX here.
-                            let anchor_instant = callback_instant
-                                + Duration::from_micros(min_playback_delta_us);
-                            let handoff_instant = if started {
-                                anchor_instant
-                            } else {
-                                // Startup handoff: anchor to `+ handoff_delta` (this buffer's
-                                // end = the next callback's start) so the next start gate sees
-                                // `expected ≈ playback_instant`. Playing now would misalign the
-                                // cursor by one buffer, so we stay silent for this one period.
-                                let handoff_delta =
-                                    Duration::from_secs_f64(frames as f64 / sample_rate as f64);
-                                anchor_instant + handoff_delta
-                            };
-                            let client_micros =
-                                sync.instant_to_client_micros(handoff_instant) + delay_us as i64;
-                            if let Some(server_time) = sync.client_to_server_micros(client_micros) {
-                                let Some(outcome) = try_callback_queue(
-                                    &renderer_for_data,
-                                    scope,
-                                    &queue,
-                                    frames,
-                                    CallbackQueuePhase::StartupReanchor,
-                                    |queue, _permit| {
-                                        if queue.generation != generation || !queue.initialized {
-                                            return StartupReanchorOutcome::Stale;
-                                        }
-                                        let Some(cursor_us) = queue
-                                            .first_playable_cursor_at_or_after(server_time)
-                                        else {
-                                            return StartupReanchorOutcome::NoPlayable;
-                                        };
-                                        queue.cursor_us = cursor_us;
-                                        queue.cursor_remainder = 0;
-                                        queue.force_reanchor = false;
-                                        StartupReanchorOutcome::Applied(cursor_us)
-                                    },
-                                ) else {
-                                    emit_silence(data);
-                                    return;
-                                };
-                                match outcome {
-                                    StartupReanchorOutcome::Applied(cursor_us) => {
-                                        observation.startup_reanchors = observation.startup_reanchors.saturating_add(1);
-                                        effective_cursor_us = cursor_us;
-                                        reanchor_applied = true;
-                                        schedule = CorrectionSchedule::default();
-                                        insert_counter = 0;
-                                        drop_counter = 0;
-                                        // The cursor just jumped (e.g. a
-                                        // static-delay change, which does not
-                                        // bump the generation); prior
-                                        // measurements describe the old
-                                        // timeline.
-                                        error_filter.reset();
-                                        engage_gate.reset();
-                                        log::debug!(
-                                            "Sync reanchor applied: cursor reset to server_time={cursor_us}µs"
-                                        );
-                                    }
-                                    StartupReanchorOutcome::NoPlayable if !handoff_warned => {
-                                        handoff_warned = true;
-                                        log::warn!(
-                                            "Sync reanchor: no playable buffer at or after \
-                                             server_time={server_time}µs — staying silent"
-                                        );
-                                    }
-                                    StartupReanchorOutcome::NoPlayable
-                                    | StartupReanchorOutcome::Stale => {}
-                                }
-                            }
-
-                            if !reanchor_applied || !started {
-                                stats.silent_callbacks += 1;
-                                if trace_logging && should_log_sample(stats.silent_callbacks) {
-                                    log::trace!(
-                                        "Audio callback silent during reanchor: callback={}, silent_callback={}, reanchor_applied={}, started={}, queued={:.1}ms, buffers={}, generation={}",
-                                        stats.callbacks,
-                                        stats.silent_callbacks,
-                                        reanchor_applied,
-                                        started,
-                                        us_to_ms(queued_us),
-                                        queued_buffers,
-                                        generation,
-                                    );
-                                }
-                                emit_silence(data);
-                                return;
-                            }
-                        }
-
-                        if let Some(expected_instant) = sync
-                            .server_to_local_instant_with_latency(effective_cursor_us, delay_us)
-                        {
-                            // Pre-start only: hold silence until the cursor's
-                            // scheduled instant. After start, "early" readings
-                            // are jitter — injecting silence here caused real
-                            // dropouts (audible blips); the planner handles
-                            // sustained earliness instead.
-                            let early_window = Duration::from_millis(1);
-                            if !started && playback_instant + early_window < expected_instant {
-                                stats.silent_callbacks += 1;
-                                if trace_logging && should_log_sample(stats.silent_callbacks) {
-                                    let early_us = expected_instant
-                                        .duration_since(playback_instant)
-                                        .as_micros() as u64;
-                                    log::trace!(
-                                        "Audio callback early; emitting silence: callback={}, silent_callback={}, early={:.1}ms, cursor={}µs, queued={:.1}ms, buffers={}, generation={}",
-                                        stats.callbacks,
-                                        stats.silent_callbacks,
-                                        us_to_ms(early_us),
-                                        effective_cursor_us,
-                                        us_to_ms(queued_us),
-                                        queued_buffers,
-                                        generation,
-                                    );
-                                }
-                                emit_silence(data);
-                                return;
-                            }
-                            if !started {
-                                started = true;
-                                log::debug!(
-                                    "Audio playback started: callback={}, cursor={}µs, queued={:.1}ms, buffers={}, silent_callbacks_before_start={}, sync_lock_misses={}",
-                                    stats.callbacks,
-                                    effective_cursor_us,
-                                    us_to_ms(queued_us),
-                                    queued_buffers,
-                                    stats.silent_callbacks,
-                                    stats.sync_lock_misses,
+                        },
+                        move |err| {
+                            // cpal reports a refused real-time promotion as
+                            // RealtimeDenied ("Audio will still play"); playback
+                            // continues at normal priority. Warn without storing:
+                            // take_error()/has_error() signal fatal stream
+                            // failures, and a consumer must not tear down a
+                            // working stream over a scheduling downgrade.
+                            if err.kind() == cpal::ErrorKind::RealtimeDenied {
+                                log::warn!(
+                                    "Audio thread priority promotion failed (non-fatal): {err}"
                                 );
+                                return;
                             }
-
-                            let raw_error_us = if playback_instant >= expected_instant {
-                                playback_instant
-                                    .duration_since(expected_instant)
-                                    .as_micros() as i64
-                            } else {
-                                -(expected_instant
-                                    .duration_since(playback_instant)
-                                    .as_micros() as i64)
-                            };
-                            // A single reading can sit a whole engine period
-                            // above true alignment while the FIFO plays
-                            // gaplessly (see SyncErrorFilter); plan against
-                            // the window floor, never one wake's snapshot.
-                            let error_us = error_filter.update(raw_error_us);
-                            observation.raw_error_us = Some(raw_error_us);
-                            observation.filtered_error_us = Some(error_us);
-                            let planned_schedule =
-                                planner.plan(error_us, sample_rate, schedule.is_correcting());
-                            // Corrections mutate audible frames: engage only
-                            // on sustained evidence over a warm filter (see
-                            // EngageGate).
-                            let gated_schedule = engage_gate.admit(
-                                planned_schedule,
-                                schedule.is_correcting(),
-                                error_filter.is_warm(),
-                            );
-                            if gated_schedule != planned_schedule {
-                                stats.gate_suppressed_corrections += 1;
-                                if trace_logging
-                                    && should_log_sample(stats.gate_suppressed_corrections)
-                                {
-                                    log::trace!(
-                                        "Sync correction awaiting sustained error: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, generation={}",
-                                        stats.callbacks,
-                                        stats.gate_suppressed_corrections,
-                                        error_us as f64 / 1000.0,
-                                        raw_error_us as f64 / 1000.0,
-                                        generation,
-                                    );
-                                }
-                            }
-                            let planned_schedule = gated_schedule;
-                            // While the sync estimate is still converging,
-                            // measured error is mostly movement of the
-                            // estimate itself; correcting for it chases
-                            // filter noise audibly. Trust the server's audio
-                            // until settled, honoring only gross reanchors.
-                            let new_schedule = if sync_settled || planned_schedule.reanchor {
-                                planned_schedule
-                            } else {
-                                if planned_schedule.is_correcting() {
-                                    stats.warmup_suppressed_corrections += 1;
-                                    if trace_logging
-                                        && should_log_sample(
-                                            stats.warmup_suppressed_corrections,
-                                        )
-                                    {
-                                        log::trace!(
-                                            "Sync correction suppressed during clock warm-up: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, generation={}",
-                                            stats.callbacks,
-                                            stats.warmup_suppressed_corrections,
-                                            error_us as f64 / 1000.0,
-                                            raw_error_us as f64 / 1000.0,
-                                            generation,
-                                        );
-                                    }
-                                }
-                                CorrectionSchedule::default()
-                            };
-                            if new_schedule != schedule {
-                                if new_schedule.is_correcting() != schedule.is_correcting() {
-                                    if new_schedule.is_correcting() {
-                                        stats.correction_engagements += 1;
-                                        log::debug!(
-                                            "Sync correction engaged: error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, callback={}, generation={}",
-                                            error_us as f64 / 1000.0,
-                                            raw_error_us as f64 / 1000.0,
-                                            new_schedule.insert_every_n_frames,
-                                            new_schedule.drop_every_n_frames,
-                                            new_schedule.reanchor,
-                                            stats.callbacks,
-                                            generation,
-                                        );
-                                    } else {
-                                        // The floor lags rises, so error= may
-                                        // read worse than raw_error= here;
-                                        // expected, not a bug.
-                                        log::debug!(
-                                            "Sync correction disengaged: error={:.3}ms, raw_error={:.3}ms, callback={}, generation={}",
-                                            error_us as f64 / 1000.0,
-                                            raw_error_us as f64 / 1000.0,
-                                            stats.callbacks,
-                                            generation,
-                                        );
-                                    }
-                                }
-                                if new_schedule.is_correcting() {
-                                    // The cadence is re-planned as the error
-                                    // converges, which can change the schedule
-                                    // on every callback. Sample the updates so
-                                    // each correction episode logs its first
-                                    // few adjustments and then a heartbeat;
-                                    // engage/disengage transitions are logged
-                                    // at debug above and reanchor execution is
-                                    // logged where it is applied below.
-                                    stats.correction_updates += 1;
-                                    if trace_logging
-                                        && should_log_sample(stats.correction_updates)
-                                    {
-                                        log::trace!(
-                                            "Sync correction updated: callback={}, correction_update={}, error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, queued={:.1}ms, generation={}",
-                                            stats.callbacks,
-                                            stats.correction_updates,
-                                            error_us as f64 / 1000.0,
-                                            raw_error_us as f64 / 1000.0,
-                                            new_schedule.insert_every_n_frames,
-                                            new_schedule.drop_every_n_frames,
-                                            new_schedule.reanchor,
-                                            us_to_ms(queued_us),
-                                            generation,
-                                        );
-                                    }
-                                } else {
-                                    stats.correction_updates = 0;
-                                }
-                                schedule = new_schedule;
-                                insert_counter = schedule.insert_every_n_frames;
-                                drop_counter = schedule.drop_every_n_frames;
-                            }
-
-                            if schedule.reanchor {
-                                // Mirror of the start-gate subtraction: audio
-                                // emitted now is heard `delay_us` later, so
-                                // anchor the cursor to that hear-instant —
-                                // derived from the delta floor, not this
-                                // wake's reading (see min_playback_delta_us).
-                                let anchor_instant = callback_instant
-                                    + Duration::from_micros(min_playback_delta_us);
-                                let client_micros = sync.instant_to_client_micros(anchor_instant)
-                                    + delay_us as i64;
-                                if let Some(server_time) =
-                                    sync.client_to_server_micros(client_micros)
-                                {
-                                    if try_callback_queue(
-                                        &renderer_for_data,
-                                        scope,
-                                        &queue,
-                                        frames,
-                                        CallbackQueuePhase::CorrectionReanchor,
-                                        |queue, _permit| {
-                                            queue.cursor_us = server_time;
-                                            queue.cursor_remainder = 0;
-                                        },
-                                    )
-                                    .is_none()
-                                    {
-                                        emit_silence(data);
-                                        return;
-                                    }
-                                    observation.correction_reanchors = observation.correction_reanchors.saturating_add(1);
-                                    observation.last_reanchor_error_us = Some(error_us);
-                                    log::debug!(
-                                        "Sync reanchor applied: cursor reset to server_time={server_time}µs"
-                                    );
-                                }
-                                schedule = CorrectionSchedule::default();
-                                insert_counter = 0;
-                                drop_counter = 0;
-                                stats.correction_updates = 0;
-                                // The cursor just jumped; prior measurements
-                                // describe the old timeline.
-                                error_filter.reset();
-                                engage_gate.reset();
-                            }
-                        } else if schedule.is_correcting() {
-                            // Conversions went dark (the implausible-drift
-                            // safety net): stop correcting rather than
-                            // resample blind on the stale cadence.
-                            log::debug!(
-                                "Sync conversions unavailable; clearing correction schedule: callback={}, generation={}",
-                                stats.callbacks,
-                                generation,
-                            );
-                            schedule = CorrectionSchedule::default();
-                            insert_counter = 0;
-                            drop_counter = 0;
-                            stats.correction_updates = 0;
-                            error_filter.reset();
-                            engage_gate.reset();
-                        }
-                    }
-
-                    // If playback hasn't started yet (clock sync not converged,
-                    // lock contention, or pre-start gate active), output silence.
-                    // Audio data stays in the ring buffer for when sync converges
-                    // and reanchor positions the cursor correctly.
-                    if !started {
-                        stats.silent_callbacks += 1;
-                        if trace_logging && should_log_sample(stats.silent_callbacks) {
-                            log::trace!(
-                                "Audio callback silent before start: callback={}, silent_callback={}, cursor_present={}, queued={:.1}ms, buffers={}, generation={}",
-                                stats.callbacks,
-                                stats.silent_callbacks,
-                                cursor_us.is_some(),
-                                us_to_ms(queued_us),
-                                queued_buffers,
-                                generation,
-                            );
-                        }
-                        emit_silence(data);
-                        return;
-                    }
-
-                    let Some((mut renderer_permit, mut queue_guard)) =
-                        try_callback_queue_guards(
-                            &renderer_for_data,
-                            scope,
-                            &queue,
-                            frames,
-                            CallbackQueuePhase::Render,
-                        )
-                    else {
-                        emit_silence(data);
-                        return;
-                    };
-                    match renderer_permit.scheduled_start(presentation_zone_us) {
-                        ScheduledStartOutcome::Waiting { .. } => {
-                            drop(queue_guard);
-                            drop(renderer_permit);
-                            stats.silent_callbacks += 1;
-                            emit_silence(data);
-                            return;
-                        }
-                        ScheduledStartOutcome::BoundaryWon { start_at_zone_us } => {
-                            log::debug!(
-                                "Scheduled presentation boundary won: start_at_zone_us={start_at_zone_us}, callback={}, generation={}",
-                                stats.callbacks,
-                                generation,
-                            );
-                        }
-                        ScheduledStartOutcome::Unscheduled
-                        | ScheduledStartOutcome::Started { .. } => {}
-                        ScheduledStartOutcome::Closed | ScheduledStartOutcome::StaleScope => {
-                            debug_assert!(false, "callback permit guarantees an open current scope");
-                            drop(queue_guard);
-                            drop(renderer_permit);
-                            renderer_for_data.record_callback_underrun(frames as u64);
-                            emit_silence(data);
-                            return;
-                        }
-                    }
-                    f32_buffer.resize(data.len(), 0.0);
-
-                    let (callback_underrun_frames, queued_after_us, buffers_after) = {
-                        let queue = &mut *queue_guard;
-                        let mut missing_frames = 0u64;
-                        let mut consumed_frames = 0usize;
-                        let mut out_index = 0;
-
-                        for _ in 0..frames {
-                            if schedule.drop_every_n_frames > 0 {
-                                drop_counter = drop_counter.saturating_sub(1);
-                                if drop_counter == 0 {
-                                    // Discard one frame to catch up
-                                    if queue.consume_next_frame(channels, sample_rate, None) {
-                                        observation.dropped_frames = observation.dropped_frames.saturating_add(1);
-                                        consumed_frames += 1;
-                                    }
-                                    drop_counter = schedule.drop_every_n_frames;
-                                    // Get and output the next frame (don't repeat last_frame)
-                                    if queue.consume_next_frame(
-                                        channels,
-                                        sample_rate,
-                                        Some(&mut last_frame),
-                                    ) {
-                                        consumed_frames += 1;
-                                        for sample in &last_frame {
-                                            f32_buffer[out_index] = f32::from_sample(*sample);
-                                            out_index += 1;
-                                        }
-                                    } else {
-                                        for sample in &last_frame {
-                                            f32_buffer[out_index] = f32::from_sample(*sample);
-                                            out_index += 1;
-                                        }
-                                    }
-                                    continue;
-                                }
-                            }
-
-                            if schedule.insert_every_n_frames > 0 {
-                                insert_counter = insert_counter.saturating_sub(1);
-                                if insert_counter == 0 {
-                                    insert_counter = schedule.insert_every_n_frames;
-                                    observation.inserted_frames = observation.inserted_frames.saturating_add(1);
-                                    for sample in &last_frame {
-                                        f32_buffer[out_index] = f32::from_sample(*sample);
-                                        out_index += 1;
-                                    }
-                                    continue;
-                                }
-                            }
-
-                            if queue.consume_next_frame(
-                                channels,
-                                sample_rate,
-                                Some(&mut last_frame),
-                            ) {
-                                consumed_frames += 1;
-                                for sample in &last_frame {
-                                    f32_buffer[out_index] = f32::from_sample(*sample);
-                                    out_index += 1;
-                                }
-                            } else {
-                                missing_frames += 1;
-                                for _ in 0..channels {
-                                    f32_buffer[out_index] = 0.0;
-                                    out_index += 1;
-                                }
-                            }
-                        }
-
-                        let buffers_after = queue.buffer_count();
-                        let queued_after_us = if debug_logging {
-                            queue.queued_duration_us(channels, sample_rate)
-                        } else {
-                            0
-                        };
-                        renderer_permit.record_actual_progress(
-                            consumed_frames,
-                            None,
-                            queue.queued_frames(channels),
-                            buffers_after,
-                        );
-                        (missing_frames, queued_after_us, buffers_after)
-                    };
-                    drop(queue_guard);
-                    drop(renderer_permit);
-                    renderer_for_data.record_callback_underrun(callback_underrun_frames);
-                    observation.underrun_frames = observation.underrun_frames.saturating_add(callback_underrun_frames);
-
-                    let recovered = callback_underrun_frames == 0
-                        && stats.consecutive_underrun_callbacks > 0;
-                    if callback_underrun_frames > 0 {
-                        stats.underrun_frames += callback_underrun_frames;
-                        stats.underrun_callbacks += 1;
-                        stats.consecutive_underrun_callbacks += 1;
-
-                        // Per-generation totals reset on stream changes, so
-                        // every stream logs its first few underruns at debug.
-                        // That is intentional: startup underruns after a
-                        // clear/track change are the main diagnostic.
-                        if debug_logging
-                            && (should_log_sample(stats.underrun_callbacks)
-                                || should_log_sample(stats.consecutive_underrun_callbacks))
-                        {
-                            log::debug!(
-                                "Audio underrun: callback={}, missing_frames={} ({:.1}ms), queued_before={:.1}ms, queued_after={:.1}ms, buffers_after={}, cursor={:?}µs, generation={}, underrun_frames={}, underrun_callbacks={}, consecutive_underrun_callbacks={}",
-                                stats.callbacks,
-                                callback_underrun_frames,
-                                callback_underrun_frames as f64 * 1000.0 / sample_rate as f64,
-                                us_to_ms(queued_us),
-                                us_to_ms(queued_after_us),
-                                buffers_after,
-                                cursor_us,
-                                generation,
-                                stats.underrun_frames,
-                                stats.underrun_callbacks,
-                                stats.consecutive_underrun_callbacks,
-                            );
-                        }
-                    } else if recovered {
-                        let underrun_run = stats.consecutive_underrun_callbacks;
-                        stats.consecutive_underrun_callbacks = 0;
-                        log::debug!(
-                            "Audio underrun recovered: callback={}, consecutive_underrun_callbacks={}, underrun_frames={}, queued_after={:.1}ms, buffers_after={}, generation={}",
-                            stats.callbacks,
-                            underrun_run,
-                            stats.underrun_frames,
-                            us_to_ms(queued_after_us),
-                            buffers_after,
-                            generation,
-                        );
-                    }
-
-                    // Edge-triggered low-queue warnings with hysteresis, so a
-                    // queue hovering at one boundary cannot flood the log.
-                    if debug_logging {
-                        if !stats.queue_low && queued_after_us < QUEUE_LOW_WATER_US {
-                            stats.queue_low = true;
-                            log::debug!(
-                                "Playback queue low: queued={:.1}ms, buffers={}, callback={}, underrun_frames={}, generation={}",
-                                us_to_ms(queued_after_us),
-                                buffers_after,
-                                stats.callbacks,
-                                stats.underrun_frames,
-                                generation,
-                            );
-                        } else if stats.queue_low && queued_after_us >= QUEUE_RECOVERED_WATER_US {
-                            stats.queue_low = false;
-                            log::debug!(
-                                "Playback queue recovered: queued={:.1}ms, buffers={}, callback={}, generation={}",
-                                us_to_ms(queued_after_us),
-                                buffers_after,
-                                stats.callbacks,
-                                generation,
-                            );
-                        }
-                    }
-
-                    // Apply gain with per-frame ramping
-                    let target = cb_config.gain_control.gain();
-                    gain_ramp.apply(&mut f32_buffer, channels, target);
-
-                    process_output(data, &mut f32_buffer);
-
-                    // One sampled health line per rendered callback, emitted
-                    // after gain and the user process callback so it describes
-                    // the audio actually delivered.
-                    if trace_logging
-                        && callback_underrun_frames == 0
-                        && !recovered
-                        && should_log_sample(stats.callbacks)
-                    {
-                        let peak_abs = f32_buffer
-                            .iter()
-                            .map(|sample| sample.abs())
-                            .fold(0.0, f32::max);
-                        log::trace!(
-                            "Audio callback rendered: callback={}, frames={}, queued_before={:.1}ms, queued_after={:.1}ms, buffers_after={}, peak_abs={:.6}, generation={}",
-                            stats.callbacks,
-                            frames,
-                            us_to_ms(queued_us),
-                            us_to_ms(queued_after_us),
-                            buffers_after,
-                            peak_abs,
-                            generation,
-                        );
-                    }
-                    };
-                    render_callback();
-                    observation.insert_every = schedule.insert_every_n_frames;
-                    observation.drop_every = schedule.drop_every_n_frames;
-                    diagnostics.publish(observation);
-                    },
-                    move |err| {
-                        // cpal reports a refused real-time promotion as
-                        // RealtimeDenied ("Audio will still play"); playback
-                        // continues at normal priority. Warn without storing:
-                        // take_error()/has_error() signal fatal stream
-                        // failures, and a consumer must not tear down a
-                        // working stream over a scheduling downgrade.
-                        if err.kind() == cpal::ErrorKind::RealtimeDenied {
-                            log::warn!(
-                                "Audio thread priority promotion failed (non-fatal): {err}"
-                            );
-                            return;
-                        }
-                        log::error!("Audio stream error: {err}");
-                        *error.lock() = Some(err.to_string());
-                        let _ = renderer_for_error.fault(scope, RendererFault::CallbackFailed);
-                    },
-                    None,
-                )
-                .map_err(|e| Error::Output(e.to_string()))
+                            log::error!("Audio stream error: {err}");
+                            *error.lock() = Some(err.to_string());
+                            let _ = renderer_for_error.fault(scope, RendererFault::CallbackFailed);
+                        },
+                        None,
+                    )
+                    .map_err(|e| Error::Output(e.to_string()))
             }};
         }
 
@@ -2112,6 +1277,904 @@ impl SyncedPlayer {
     }
 }
 
+/// Canonical data callback, constructed independently of opening the native stream.
+/// The stream wrapper supplies one paired timestamp/source and one local capture instant.
+fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
+    queue: Arc<Mutex<PlaybackQueue>>,
+    clock_sync: Arc<Mutex<ClockSync>>,
+    format: AudioFormat,
+    mut cb_config: CallbackConfig,
+    renderer_for_data: RendererOwner,
+    scope: PlayerScope,
+    diagnostics: SyncDiagnosticsReader,
+) -> impl FnMut(
+    &mut [T],
+    cpal::OutputStreamTimestamp,
+    cpal::OutputTimestampSource,
+    Option<cpal::OutputTimestampDiagnostics>,
+    Instant,
+) + Send {
+    let channels = format.channels as usize;
+    let sample_rate = format.sample_rate;
+    let planner = CorrectionPlanner::new();
+    let mut error_filter = SyncErrorFilter::new();
+    let mut engage_gate = EngageGate::new();
+    let mut last_frame = vec![i32::EQUILIBRIUM; channels];
+    let mut schedule = CorrectionSchedule::default();
+    let mut insert_counter = 0u32;
+    let mut drop_counter = 0u32;
+    let mut started = false;
+    let mut handoff_warned = false;
+    let mut sync_settle_logged = false;
+    let mut last_callback_instant: Option<Instant> = None;
+    let mut last_playback_timestamp: Option<cpal::StreamInstant> = None;
+    let mut last_playback_delta_us: Option<u64> = None;
+    // Running minimum of measured presentation latency, reset per
+    // generation. Reanchors anchor against this floor rather than one
+    // wake's reading: padding noise is one-sided (see SyncErrorFilter),
+    // so a single sample may run a whole period high, and anchoring to it
+    // bakes that period into the timeline until corrections audibly
+    // unwind it. A stale floor after a latency-regime shift costs at most
+    // one period of realignment — no worse than the shift itself.
+    let mut min_playback_delta: Option<Duration> = None;
+    let mut last_measured_playback_delta: Option<Duration> = None;
+    let mut last_generation = 0u64;
+    let mut stats = CallbackStats::default();
+    let mut observation = SyncDiagnosticsSnapshot {
+        sample_rate,
+        ..Default::default()
+    };
+    let mut previous_callback_at: Option<Instant> = None;
+    let initial_gain = cb_config.gain_control.gain();
+    let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
+    let mut f32_buffer = Vec::<f32>::new();
+    move |data: &mut [T], timestamp, timestamp_source, timestamp_diagnostics, captured_at| {
+        observation.callbacks = observation.callbacks.saturating_add(1);
+        observation.captured_at = Some(captured_at);
+        if timestamp_source == cpal::OutputTimestampSource::MonotonicFallback {
+            if let Some(evidence) = timestamp_diagnostics {
+                if let Some(reason) = evidence.fallback_reason {
+                    use cpal::OutputTimestampFallbackReason::*;
+                    let count = match reason {
+                        Unavailable => &mut observation.fallback_unavailable,
+                        Unsupported => &mut observation.fallback_unsupported,
+                        Invalid => &mut observation.fallback_invalid,
+                        NonMonotonic => &mut observation.fallback_non_monotonic,
+                        ClockDomainMismatch => &mut observation.fallback_clock_domain_mismatch,
+                    };
+                    *count = count.saturating_add(1);
+                    observation.last_timestamp_fallback_callback = observation.callbacks;
+                    observation.last_timestamp_fallback = Some(evidence);
+                }
+            }
+        }
+        observation.callback_frames = data.len() / channels;
+        observation.raw_error_us = None;
+        observation.insert_every = 0;
+        observation.drop_every = 0;
+        observation.filtered_error_us = None;
+        observation.playback_delay_us = timestamp
+            .playback
+            .duration_since(timestamp.callback)
+            .as_micros() as u64;
+        if let Some(previous) = previous_callback_at {
+            observation.max_callback_gap_us = observation
+                .max_callback_gap_us
+                .max(captured_at.duration_since(previous).as_micros() as u64);
+        }
+        previous_callback_at = Some(captured_at);
+        // Keep all early returns inside the render operation, so
+        // silence and contention still publish a fresh observation.
+        let mut render_callback = || {
+            let mut process_output = |data: &mut [T], buffer: &mut Vec<f32>| {
+                if let Some(ref mut cb) = cb_config.process_callback {
+                    cb(buffer);
+                }
+
+                for (dst, &sample) in data.iter_mut().zip(buffer.iter()) {
+                    *dst = <T>::from_sample(sample);
+                }
+            };
+
+            // Advance the gain ramp even while silent so the first real
+            // audio resumes at the target gain with no fade-in.
+            let mut emit_silence = |data: &mut [T]| {
+                let target = cb_config.gain_control.gain();
+                gain_ramp.advance(data.len() / channels, target);
+                f32_buffer.clear();
+                f32_buffer.resize(data.len(), 0.0);
+                process_output(data, &mut f32_buffer);
+            };
+
+            // Snapshot the level checks once per callback. At info level
+            // these two loads are the only per-callback logging cost.
+            let debug_logging = log::log_enabled!(log::Level::Debug);
+            let trace_logging = log::log_enabled!(log::Level::Trace);
+
+            let timestamp_observation =
+                classify_output_timestamp(timestamp, timestamp_source, last_playback_timestamp);
+            if !renderer_for_data.try_callback_telemetry(
+                scope,
+                timestamp_observation.source,
+                timestamp_observation.monotonic_violation,
+            ) {
+                emit_silence(data);
+                return;
+            }
+            last_playback_timestamp = Some(timestamp_observation.timestamp.playback);
+
+            stats.callbacks += 1;
+            let frames = data.len() / channels;
+
+            // Read queue timing state together. The generation is
+            // rechecked before consuming force_reanchor so a clear()
+            // racing with this callback cannot clear the next startup's
+            // one-shot handoff.
+            let Some((
+                start_state,
+                generation,
+                cursor_us,
+                force_reanchor,
+                delay_us,
+                queued_us,
+                queued_buffers,
+            )) = try_callback_queue(
+                &renderer_for_data,
+                scope,
+                &queue,
+                frames,
+                CallbackQueuePhase::TimingSnapshot,
+                |queue, permit| {
+                    let cursor = if queue.initialized {
+                        Some(queue.cursor_us)
+                    } else {
+                        None
+                    };
+                    // Queue depth costs a walk over every queued buffer,
+                    // so only measure it when a log line below can print
+                    // it.
+                    let (queued_us, queued_buffers) = if debug_logging {
+                        (
+                            queue.queued_duration_us(channels, sample_rate),
+                            queue.buffer_count(),
+                        )
+                    } else {
+                        (0, 0)
+                    };
+                    (
+                        permit.start_state(),
+                        queue.generation,
+                        cursor,
+                        queue.force_reanchor,
+                        cb_config.static_delay_us.load(Ordering::Relaxed),
+                        queued_us,
+                        queued_buffers,
+                    )
+                },
+            )
+            else {
+                emit_silence(data);
+                return;
+            };
+            // This first branch is an advisory snapshot only. Public
+            // arm/clear operations may legally change the state before
+            // the render permit is acquired below, so the render permit
+            // remains the sole authority for the transition decision.
+            match start_state {
+                StartState::Idle | StartState::Armed { .. } | StartState::BoundaryWon { .. } => {}
+            }
+            observation.generation = generation;
+            if generation != last_generation {
+                log::debug!(
+            "Playback queue generation changed: {} -> {}, queued={:.1}ms, buffers={}, callbacks={}, silent_callbacks={}, underrun_callbacks={}, underrun_frames={}, sync_lock_misses={}, correction_engagements={}",
+            last_generation,
+            generation,
+            us_to_ms(queued_us),
+            queued_buffers,
+            stats.callbacks,
+            stats.silent_callbacks,
+            stats.underrun_callbacks,
+            stats.underrun_frames,
+            stats.sync_lock_misses,
+            stats.correction_engagements,
+        );
+                last_generation = generation;
+                started = false;
+                schedule = CorrectionSchedule::default();
+                insert_counter = 0;
+                drop_counter = 0;
+                error_filter.reset();
+                engage_gate.reset();
+                min_playback_delta = None;
+                last_measured_playback_delta = None;
+                stats.reset_for_generation();
+                for sample in last_frame.iter_mut() {
+                    *sample = i32::EQUILIBRIUM;
+                }
+                handoff_warned = false;
+            }
+
+            let callback_instant = captured_at;
+            let ts = timestamp_observation.timestamp;
+            let measured_playback_delta = (timestamp_source
+                != cpal::OutputTimestampSource::MonotonicFallback
+                && ts.playback >= ts.callback)
+                .then(|| ts.playback.duration_since(ts.callback));
+            if let Some(delta) = measured_playback_delta {
+                min_playback_delta =
+                    Some(min_playback_delta.map_or(delta, |floor| floor.min(delta)));
+                last_measured_playback_delta = Some(delta);
+            }
+            // Scheduling must keep advancing even without a device measurement. Reuse
+            // only a latency duration, never an old absolute presentation instant.
+            // The initial one-buffer estimate is advisory and cannot train correction.
+            let callback_period = Duration::from_secs_f64(frames as f64 / sample_rate as f64);
+            let playback_delta = measured_playback_delta
+                .or(last_measured_playback_delta)
+                .unwrap_or(callback_period);
+            let playback_instant = callback_instant + playback_delta;
+            let mut presentation_zone_us = None;
+
+            // Both values are normally steady, so a step in either
+            // explains a sync-error step: a callback gap means this
+            // thread stalled; a playback-delta shift means the OS
+            // moved the presentation timeline.
+            let playback_delta_us = playback_delta.as_micros() as u64;
+            if let Some(last) = last_callback_instant {
+                let gap_us = callback_instant.duration_since(last).as_micros() as u64;
+                let period_us = frames as u64 * 1_000_000 / u64::from(sample_rate.max(1));
+                if gap_us >= 2 * period_us {
+                    log::debug!(
+                "Audio callback gap: {:.1}ms since previous (period ~{:.1}ms), callback={}, generation={}",
+                us_to_ms(gap_us),
+                us_to_ms(period_us),
+                stats.callbacks,
+                generation,
+            );
+                }
+            }
+            last_callback_instant = Some(callback_instant);
+            if let Some(last) = last_playback_delta_us {
+                if playback_delta_us.abs_diff(last) > 1_000 {
+                    log::debug!(
+                "Output timeline shifted: playback_delta {:.1}ms -> {:.1}ms, callback={}, generation={}",
+                us_to_ms(last),
+                us_to_ms(playback_delta_us),
+                stats.callbacks,
+                generation,
+            );
+                }
+            }
+            last_playback_delta_us = Some(playback_delta_us);
+
+            // try_lock: skip sync if contended rather than blocking
+            // the audio thread. force_reanchor is sticky in the
+            // queue, so it will be retried on the next callback.
+            let sync = clock_sync.try_lock();
+            if cursor_us.is_some() && sync.is_none() {
+                // Count lock contention only once playback has an
+                // initialized cursor; before that there is no timeline
+                // position to synchronize yet.
+                stats.sync_lock_misses += 1;
+                observation.sync_lock_misses = observation.sync_lock_misses.saturating_add(1);
+                if trace_logging && should_log_sample(stats.sync_lock_misses) {
+                    log::trace!(
+                "Audio callback skipped sync: clock lock contended, callback={}, sync_lock_miss={}, queued={:.1}ms, buffers={}, started={}",
+                stats.callbacks,
+                stats.sync_lock_misses,
+                us_to_ms(queued_us),
+                queued_buffers,
+                started,
+            );
+                }
+            }
+            if let (Some(cursor_us), Some(sync)) = (cursor_us, sync) {
+                presentation_zone_us = canonical_presentation_zone_us(
+                    sync.client_to_server_micros(sync.instant_to_client_micros(playback_instant)),
+                    delay_us,
+                );
+                // Emit each sample `delay` earlier so downstream
+                // (amp/speaker) latency lands it on time. The reanchor
+                // below adds the same delay in the local→server
+                // direction; the two signs must stay in step or the
+                // planner chases a phantom error every callback.
+                let mut effective_cursor_us = cursor_us;
+                let sync_settled = sync.is_settled();
+                if sync_settled && !sync_settle_logged {
+                    sync_settle_logged = true;
+                    // Warm-up measurements track the converging clock
+                    // estimate, not playback; start the filter fresh.
+                    error_filter.reset();
+                    engage_gate.reset();
+                    log::debug!(
+                "Clock sync settled; corrections enabled: callback={}, suppressed_during_warmup={}, generation={}",
+                stats.callbacks,
+                stats.warmup_suppressed_corrections,
+                generation,
+            );
+                }
+
+                if force_reanchor {
+                    let mut reanchor_applied = false;
+                    // Startup/explicit handoff can use the scheduling estimate when
+                    // no device measurement exists. It never updates the measured floor.
+                    let anchor_instant =
+                        callback_instant + min_playback_delta.unwrap_or(playback_delta);
+                    let handoff_instant = if started {
+                        anchor_instant
+                    } else {
+                        // Startup handoff: anchor to `+ handoff_delta` (this buffer's
+                        // end = the next callback's start) so the next start gate sees
+                        // `expected ≈ playback_instant`. Playing now would misalign the
+                        // cursor by one buffer, so we stay silent for this one period.
+                        let handoff_delta =
+                            Duration::from_secs_f64(frames as f64 / sample_rate as f64);
+                        anchor_instant + handoff_delta
+                    };
+                    let client_micros =
+                        sync.instant_to_client_micros(handoff_instant) + delay_us as i64;
+                    if let Some(server_time) = sync.client_to_server_micros(client_micros) {
+                        let Some(outcome) = try_callback_queue(
+                            &renderer_for_data,
+                            scope,
+                            &queue,
+                            frames,
+                            CallbackQueuePhase::StartupReanchor,
+                            |queue, _permit| {
+                                if queue.generation != generation || !queue.initialized {
+                                    return StartupReanchorOutcome::Stale;
+                                }
+                                let Some(cursor_us) =
+                                    queue.first_playable_cursor_at_or_after(server_time)
+                                else {
+                                    return StartupReanchorOutcome::NoPlayable;
+                                };
+                                queue.cursor_us = cursor_us;
+                                queue.cursor_remainder = 0;
+                                queue.force_reanchor = false;
+                                StartupReanchorOutcome::Applied(cursor_us)
+                            },
+                        ) else {
+                            emit_silence(data);
+                            return;
+                        };
+                        match outcome {
+                            StartupReanchorOutcome::Applied(cursor_us) => {
+                                observation.startup_reanchors =
+                                    observation.startup_reanchors.saturating_add(1);
+                                effective_cursor_us = cursor_us;
+                                reanchor_applied = true;
+                                schedule = CorrectionSchedule::default();
+                                insert_counter = 0;
+                                drop_counter = 0;
+                                // The cursor just jumped (e.g. a
+                                // static-delay change, which does not
+                                // bump the generation); prior
+                                // measurements describe the old
+                                // timeline.
+                                error_filter.reset();
+                                engage_gate.reset();
+                                log::debug!(
+                            "Sync reanchor applied: cursor reset to server_time={cursor_us}µs"
+                        );
+                            }
+                            StartupReanchorOutcome::NoPlayable if !handoff_warned => {
+                                handoff_warned = true;
+                                log::warn!(
+                                    "Sync reanchor: no playable buffer at or after \
+                             server_time={server_time}µs — staying silent"
+                                );
+                            }
+                            StartupReanchorOutcome::NoPlayable | StartupReanchorOutcome::Stale => {}
+                        }
+                    }
+
+                    if !reanchor_applied || !started {
+                        stats.silent_callbacks += 1;
+                        if trace_logging && should_log_sample(stats.silent_callbacks) {
+                            log::trace!(
+                        "Audio callback silent during reanchor: callback={}, silent_callback={}, reanchor_applied={}, started={}, queued={:.1}ms, buffers={}, generation={}",
+                        stats.callbacks,
+                        stats.silent_callbacks,
+                        reanchor_applied,
+                        started,
+                        us_to_ms(queued_us),
+                        queued_buffers,
+                        generation,
+                    );
+                        }
+                        emit_silence(data);
+                        return;
+                    }
+                }
+
+                if let Some(expected_instant) =
+                    sync.server_to_local_instant_with_latency(effective_cursor_us, delay_us)
+                {
+                    // Pre-start only: hold silence until the cursor's
+                    // scheduled instant. After start, "early" readings
+                    // are jitter — injecting silence here caused real
+                    // dropouts (audible blips); the planner handles
+                    // sustained earliness instead.
+                    let early_window = Duration::from_millis(1);
+                    if !started && playback_instant + early_window < expected_instant {
+                        stats.silent_callbacks += 1;
+                        if trace_logging && should_log_sample(stats.silent_callbacks) {
+                            let early_us = expected_instant
+                                .duration_since(playback_instant)
+                                .as_micros() as u64;
+                            log::trace!(
+                        "Audio callback early; emitting silence: callback={}, silent_callback={}, early={:.1}ms, cursor={}µs, queued={:.1}ms, buffers={}, generation={}",
+                        stats.callbacks,
+                        stats.silent_callbacks,
+                        us_to_ms(early_us),
+                        effective_cursor_us,
+                        us_to_ms(queued_us),
+                        queued_buffers,
+                        generation,
+                    );
+                        }
+                        emit_silence(data);
+                        return;
+                    }
+                    if !started {
+                        started = true;
+                        log::debug!(
+                    "Audio playback started: callback={}, cursor={}µs, queued={:.1}ms, buffers={}, silent_callbacks_before_start={}, sync_lock_misses={}",
+                    stats.callbacks,
+                    effective_cursor_us,
+                    us_to_ms(queued_us),
+                    queued_buffers,
+                    stats.silent_callbacks,
+                    stats.sync_lock_misses,
+                );
+                    }
+
+                    if measured_playback_delta.is_some() {
+                        let raw_error_us = if playback_instant >= expected_instant {
+                            playback_instant
+                                .duration_since(expected_instant)
+                                .as_micros() as i64
+                        } else {
+                            -(expected_instant
+                                .duration_since(playback_instant)
+                                .as_micros() as i64)
+                        };
+                        // A single reading can sit a whole engine period
+                        // above true alignment while the FIFO plays
+                        // gaplessly (see SyncErrorFilter); plan against
+                        // the window floor, never one wake's snapshot.
+                        let error_us = error_filter.update(raw_error_us);
+                        observation.raw_error_us = Some(raw_error_us);
+                        observation.filtered_error_us = Some(error_us);
+                        let planned_schedule =
+                            planner.plan(error_us, sample_rate, schedule.is_correcting());
+                        // Corrections mutate audible frames: engage only
+                        // on sustained evidence over a warm filter (see
+                        // EngageGate).
+                        let gated_schedule = engage_gate.admit(
+                            planned_schedule,
+                            schedule.is_correcting(),
+                            error_filter.is_warm(),
+                        );
+                        if gated_schedule != planned_schedule {
+                            stats.gate_suppressed_corrections += 1;
+                            if trace_logging && should_log_sample(stats.gate_suppressed_corrections)
+                            {
+                                log::trace!(
+                            "Sync correction awaiting sustained error: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, generation={}",
+                            stats.callbacks,
+                            stats.gate_suppressed_corrections,
+                            error_us as f64 / 1000.0,
+                            raw_error_us as f64 / 1000.0,
+                            generation,
+                        );
+                            }
+                        }
+                        let planned_schedule = gated_schedule;
+                        // While the sync estimate is still converging,
+                        // measured error is mostly movement of the
+                        // estimate itself; correcting for it chases
+                        // filter noise audibly. Trust the server's audio
+                        // until settled, honoring only gross reanchors.
+                        let new_schedule = if sync_settled || planned_schedule.reanchor {
+                            planned_schedule
+                        } else {
+                            if planned_schedule.is_correcting() {
+                                stats.warmup_suppressed_corrections += 1;
+                                if trace_logging
+                                    && should_log_sample(stats.warmup_suppressed_corrections)
+                                {
+                                    log::trace!(
+                                "Sync correction suppressed during clock warm-up: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, generation={}",
+                                stats.callbacks,
+                                stats.warmup_suppressed_corrections,
+                                error_us as f64 / 1000.0,
+                                raw_error_us as f64 / 1000.0,
+                                generation,
+                            );
+                                }
+                            }
+                            CorrectionSchedule::default()
+                        };
+                        if new_schedule != schedule {
+                            if new_schedule.is_correcting() != schedule.is_correcting() {
+                                if new_schedule.is_correcting() {
+                                    stats.correction_engagements += 1;
+                                    log::debug!(
+                                "Sync correction engaged: error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, callback={}, generation={}",
+                                error_us as f64 / 1000.0,
+                                raw_error_us as f64 / 1000.0,
+                                new_schedule.insert_every_n_frames,
+                                new_schedule.drop_every_n_frames,
+                                new_schedule.reanchor,
+                                stats.callbacks,
+                                generation,
+                            );
+                                } else {
+                                    // The floor lags rises, so error= may
+                                    // read worse than raw_error= here;
+                                    // expected, not a bug.
+                                    log::debug!(
+                                "Sync correction disengaged: error={:.3}ms, raw_error={:.3}ms, callback={}, generation={}",
+                                error_us as f64 / 1000.0,
+                                raw_error_us as f64 / 1000.0,
+                                stats.callbacks,
+                                generation,
+                            );
+                                }
+                            }
+                            if new_schedule.is_correcting() {
+                                // The cadence is re-planned as the error
+                                // converges, which can change the schedule
+                                // on every callback. Sample the updates so
+                                // each correction episode logs its first
+                                // few adjustments and then a heartbeat;
+                                // engage/disengage transitions are logged
+                                // at debug above and reanchor execution is
+                                // logged where it is applied below.
+                                stats.correction_updates += 1;
+                                if trace_logging && should_log_sample(stats.correction_updates) {
+                                    log::trace!(
+                                "Sync correction updated: callback={}, correction_update={}, error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, queued={:.1}ms, generation={}",
+                                stats.callbacks,
+                                stats.correction_updates,
+                                error_us as f64 / 1000.0,
+                                raw_error_us as f64 / 1000.0,
+                                new_schedule.insert_every_n_frames,
+                                new_schedule.drop_every_n_frames,
+                                new_schedule.reanchor,
+                                us_to_ms(queued_us),
+                                generation,
+                            );
+                                }
+                            } else {
+                                stats.correction_updates = 0;
+                            }
+                            schedule = new_schedule;
+                            insert_counter = schedule.insert_every_n_frames;
+                            drop_counter = schedule.drop_every_n_frames;
+                        }
+
+                        if schedule.reanchor {
+                            // Mirror of the start-gate subtraction: audio
+                            // emitted now is heard `delay_us` later, so
+                            // anchor the cursor to that hear-instant —
+                            // derived from the delta floor, not this
+                            // wake's reading (see min_playback_delta).
+                            let anchor_instant =
+                                callback_instant + min_playback_delta.unwrap_or(playback_delta);
+                            let client_micros =
+                                sync.instant_to_client_micros(anchor_instant) + delay_us as i64;
+                            if let Some(server_time) = sync.client_to_server_micros(client_micros) {
+                                if try_callback_queue(
+                                    &renderer_for_data,
+                                    scope,
+                                    &queue,
+                                    frames,
+                                    CallbackQueuePhase::CorrectionReanchor,
+                                    |queue, _permit| {
+                                        queue.cursor_us = server_time;
+                                        queue.cursor_remainder = 0;
+                                    },
+                                )
+                                .is_none()
+                                {
+                                    emit_silence(data);
+                                    return;
+                                }
+                                observation.correction_reanchors =
+                                    observation.correction_reanchors.saturating_add(1);
+                                observation.last_reanchor_error_us = Some(error_us);
+                                log::debug!(
+                            "Sync reanchor applied: cursor reset to server_time={server_time}µs"
+                        );
+                            }
+                            schedule = CorrectionSchedule::default();
+                            insert_counter = 0;
+                            drop_counter = 0;
+                            stats.correction_updates = 0;
+                            // The cursor just jumped; prior measurements
+                            // describe the old timeline.
+                            error_filter.reset();
+                            engage_gate.reset();
+                        }
+                    }
+                } else if schedule.is_correcting() {
+                    // Conversions went dark (the implausible-drift
+                    // safety net): stop correcting rather than
+                    // resample blind on the stale cadence.
+                    log::debug!(
+                "Sync conversions unavailable; clearing correction schedule: callback={}, generation={}",
+                stats.callbacks,
+                generation,
+            );
+                    schedule = CorrectionSchedule::default();
+                    insert_counter = 0;
+                    drop_counter = 0;
+                    stats.correction_updates = 0;
+                    error_filter.reset();
+                    engage_gate.reset();
+                }
+            }
+
+            // If playback hasn't started yet (clock sync not converged,
+            // lock contention, or pre-start gate active), output silence.
+            // Audio data stays in the ring buffer for when sync converges
+            // and reanchor positions the cursor correctly.
+            if !started {
+                stats.silent_callbacks += 1;
+                if trace_logging && should_log_sample(stats.silent_callbacks) {
+                    log::trace!(
+                "Audio callback silent before start: callback={}, silent_callback={}, cursor_present={}, queued={:.1}ms, buffers={}, generation={}",
+                stats.callbacks,
+                stats.silent_callbacks,
+                cursor_us.is_some(),
+                us_to_ms(queued_us),
+                queued_buffers,
+                generation,
+            );
+                }
+                emit_silence(data);
+                return;
+            }
+
+            let Some((mut renderer_permit, mut queue_guard)) = try_callback_queue_guards(
+                &renderer_for_data,
+                scope,
+                &queue,
+                frames,
+                CallbackQueuePhase::Render,
+            ) else {
+                emit_silence(data);
+                return;
+            };
+            match renderer_permit.scheduled_start(presentation_zone_us) {
+                ScheduledStartOutcome::Waiting { .. } => {
+                    drop(queue_guard);
+                    drop(renderer_permit);
+                    stats.silent_callbacks += 1;
+                    emit_silence(data);
+                    return;
+                }
+                ScheduledStartOutcome::BoundaryWon { start_at_zone_us } => {
+                    log::debug!(
+                "Scheduled presentation boundary won: start_at_zone_us={start_at_zone_us}, callback={}, generation={}",
+                stats.callbacks,
+                generation,
+            );
+                }
+                ScheduledStartOutcome::Unscheduled | ScheduledStartOutcome::Started { .. } => {}
+                ScheduledStartOutcome::Closed | ScheduledStartOutcome::StaleScope => {
+                    debug_assert!(false, "callback permit guarantees an open current scope");
+                    drop(queue_guard);
+                    drop(renderer_permit);
+                    renderer_for_data.record_callback_underrun(frames as u64);
+                    emit_silence(data);
+                    return;
+                }
+            }
+            f32_buffer.resize(data.len(), 0.0);
+
+            let applied_schedule = if measured_playback_delta.is_some() {
+                schedule
+            } else {
+                CorrectionSchedule::default()
+            };
+            observation.insert_every = applied_schedule.insert_every_n_frames;
+            observation.drop_every = applied_schedule.drop_every_n_frames;
+            let (callback_underrun_frames, queued_after_us, buffers_after) = {
+                let queue = &mut *queue_guard;
+                let mut missing_frames = 0u64;
+                let mut consumed_frames = 0usize;
+                let mut out_index = 0;
+
+                for _ in 0..frames {
+                    if applied_schedule.drop_every_n_frames > 0 {
+                        drop_counter = drop_counter.saturating_sub(1);
+                        if drop_counter == 0 {
+                            // Discard one frame to catch up
+                            if queue.consume_next_frame(channels, sample_rate, None) {
+                                observation.dropped_frames =
+                                    observation.dropped_frames.saturating_add(1);
+                                consumed_frames += 1;
+                            }
+                            drop_counter = applied_schedule.drop_every_n_frames;
+                            // Get and output the next frame (don't repeat last_frame)
+                            if queue.consume_next_frame(
+                                channels,
+                                sample_rate,
+                                Some(&mut last_frame),
+                            ) {
+                                consumed_frames += 1;
+                                for sample in &last_frame {
+                                    f32_buffer[out_index] = f32::from_sample(*sample);
+                                    out_index += 1;
+                                }
+                            } else {
+                                for sample in &last_frame {
+                                    f32_buffer[out_index] = f32::from_sample(*sample);
+                                    out_index += 1;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    if applied_schedule.insert_every_n_frames > 0 {
+                        insert_counter = insert_counter.saturating_sub(1);
+                        if insert_counter == 0 {
+                            insert_counter = applied_schedule.insert_every_n_frames;
+                            observation.inserted_frames =
+                                observation.inserted_frames.saturating_add(1);
+                            for sample in &last_frame {
+                                f32_buffer[out_index] = f32::from_sample(*sample);
+                                out_index += 1;
+                            }
+                            continue;
+                        }
+                    }
+
+                    if queue.consume_next_frame(channels, sample_rate, Some(&mut last_frame)) {
+                        consumed_frames += 1;
+                        for sample in &last_frame {
+                            f32_buffer[out_index] = f32::from_sample(*sample);
+                            out_index += 1;
+                        }
+                    } else {
+                        missing_frames += 1;
+                        for _ in 0..channels {
+                            f32_buffer[out_index] = 0.0;
+                            out_index += 1;
+                        }
+                    }
+                }
+
+                let buffers_after = queue.buffer_count();
+                let queued_after_us = if debug_logging {
+                    queue.queued_duration_us(channels, sample_rate)
+                } else {
+                    0
+                };
+                renderer_permit.record_actual_progress(
+                    consumed_frames,
+                    None,
+                    queue.queued_frames(channels),
+                    buffers_after,
+                );
+                (missing_frames, queued_after_us, buffers_after)
+            };
+            drop(queue_guard);
+            drop(renderer_permit);
+            renderer_for_data.record_callback_underrun(callback_underrun_frames);
+            observation.underrun_frames = observation
+                .underrun_frames
+                .saturating_add(callback_underrun_frames);
+
+            let recovered =
+                callback_underrun_frames == 0 && stats.consecutive_underrun_callbacks > 0;
+            if callback_underrun_frames > 0 {
+                stats.underrun_frames += callback_underrun_frames;
+                stats.underrun_callbacks += 1;
+                stats.consecutive_underrun_callbacks += 1;
+
+                // Per-generation totals reset on stream changes, so
+                // every stream logs its first few underruns at debug.
+                // That is intentional: startup underruns after a
+                // clear/track change are the main diagnostic.
+                if debug_logging
+                    && (should_log_sample(stats.underrun_callbacks)
+                        || should_log_sample(stats.consecutive_underrun_callbacks))
+                {
+                    log::debug!(
+                "Audio underrun: callback={}, missing_frames={} ({:.1}ms), queued_before={:.1}ms, queued_after={:.1}ms, buffers_after={}, cursor={:?}µs, generation={}, underrun_frames={}, underrun_callbacks={}, consecutive_underrun_callbacks={}",
+                stats.callbacks,
+                callback_underrun_frames,
+                callback_underrun_frames as f64 * 1000.0 / sample_rate as f64,
+                us_to_ms(queued_us),
+                us_to_ms(queued_after_us),
+                buffers_after,
+                cursor_us,
+                generation,
+                stats.underrun_frames,
+                stats.underrun_callbacks,
+                stats.consecutive_underrun_callbacks,
+            );
+                }
+            } else if recovered {
+                let underrun_run = stats.consecutive_underrun_callbacks;
+                stats.consecutive_underrun_callbacks = 0;
+                log::debug!(
+            "Audio underrun recovered: callback={}, consecutive_underrun_callbacks={}, underrun_frames={}, queued_after={:.1}ms, buffers_after={}, generation={}",
+            stats.callbacks,
+            underrun_run,
+            stats.underrun_frames,
+            us_to_ms(queued_after_us),
+            buffers_after,
+            generation,
+        );
+            }
+
+            // Edge-triggered low-queue warnings with hysteresis, so a
+            // queue hovering at one boundary cannot flood the log.
+            if debug_logging {
+                if !stats.queue_low && queued_after_us < QUEUE_LOW_WATER_US {
+                    stats.queue_low = true;
+                    log::debug!(
+                "Playback queue low: queued={:.1}ms, buffers={}, callback={}, underrun_frames={}, generation={}",
+                us_to_ms(queued_after_us),
+                buffers_after,
+                stats.callbacks,
+                stats.underrun_frames,
+                generation,
+            );
+                } else if stats.queue_low && queued_after_us >= QUEUE_RECOVERED_WATER_US {
+                    stats.queue_low = false;
+                    log::debug!(
+                "Playback queue recovered: queued={:.1}ms, buffers={}, callback={}, generation={}",
+                us_to_ms(queued_after_us),
+                buffers_after,
+                stats.callbacks,
+                generation,
+            );
+                }
+            }
+
+            // Apply gain with per-frame ramping
+            let target = cb_config.gain_control.gain();
+            gain_ramp.apply(&mut f32_buffer, channels, target);
+
+            process_output(data, &mut f32_buffer);
+
+            // One sampled health line per rendered callback, emitted
+            // after gain and the user process callback so it describes
+            // the audio actually delivered.
+            if trace_logging
+                && callback_underrun_frames == 0
+                && !recovered
+                && should_log_sample(stats.callbacks)
+            {
+                let peak_abs = f32_buffer
+                    .iter()
+                    .map(|sample| sample.abs())
+                    .fold(0.0, f32::max);
+                log::trace!(
+            "Audio callback rendered: callback={}, frames={}, queued_before={:.1}ms, queued_after={:.1}ms, buffers_after={}, peak_abs={:.6}, generation={}",
+            stats.callbacks,
+            frames,
+            us_to_ms(queued_us),
+            us_to_ms(queued_after_us),
+            buffers_after,
+            peak_abs,
+            generation,
+        );
+            }
+        };
+        render_callback();
+        diagnostics.publish(observation);
+    }
+}
+
 impl Drop for SyncedPlayer {
     fn drop(&mut self) {
         let _ = self.teardown();
@@ -2122,8 +2185,7 @@ impl Drop for SyncedPlayer {
 mod tests {
     // Note: SyncedPlayer's convenience methods (volume, is_muted, set_volume,
     // set_mute, gain_control) delegate to GainControl which is thoroughly tested
-    // in gain.rs. Wiring tests require a real audio device (cpal Stream) and
-    // cannot run in CI.
+    // in gain.rs. Canonical data callback tests are in callback_tests.
 
     use super::{
         abort_before_start_with_queue, canonical_presentation_zone_us, classify_output_timestamp,
@@ -3934,3 +3996,6 @@ mod tests {
         assert_eq!(frame[0], 222, "expected frame from the ahead buffer");
     }
 }
+
+#[cfg(test)]
+mod callback_tests;
