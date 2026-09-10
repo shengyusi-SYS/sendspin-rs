@@ -491,6 +491,19 @@ impl ClockSync {
         ClockUpdateOutcome::Applied
     }
 
+    pub(crate) fn diagnostic_estimate(&self) -> (f64, f64, Option<f64>) {
+        if self.same_clock {
+            return (0.0, 0.0, Some(0.0));
+        }
+        (
+            self.filter.current.offset,
+            self.filter.current.drift * 1_000_000.0,
+            self.filter
+                .effective_drift()
+                .map(|drift| drift * 1_000_000.0),
+        )
+    }
+
     /// Get current RTT in microseconds
     pub fn rtt_micros(&self) -> Option<i64> {
         self.rtt_micros

@@ -11,7 +11,7 @@ use crate::audio::player_contract::{
 use crate::audio::sync_correction::{
     CorrectionPlanner, CorrectionSchedule, EngageGate, SyncErrorFilter,
 };
-use crate::audio::{AudioBuffer, AudioFormat};
+use crate::audio::{AudioBuffer, AudioFormat, SyncDiagnosticsReader, SyncDiagnosticsSnapshot};
 use crate::error::Error;
 use crate::log_sampling::should_log_sample;
 use crate::sync::ClockSync;
@@ -733,6 +733,7 @@ fn set_device_delay_state(
 
 /// Synced audio output with drift correction.
 pub struct SyncedPlayer {
+    diagnostics: SyncDiagnosticsReader,
     format: AudioFormat,
     queue: Arc<Mutex<PlaybackQueue>>,
     renderer: RendererOwner,
@@ -873,6 +874,7 @@ impl SyncedPlayer {
             scope,
         };
 
+        let diagnostics = SyncDiagnosticsReader::new(Arc::clone(&clock_sync));
         let stream = Self::build_stream(
             &device,
             &stream_config,
@@ -881,6 +883,7 @@ impl SyncedPlayer {
             format_clone,
             cb_config,
             callback_outputs,
+            diagnostics.clone(),
         )
         .map_err(|error| OpenError::Backend(OutputBackendError::new(error.to_string())))?;
         if renderer.attach_output_stream(scope, stream) != RendererOperationOutcome::Applied {
@@ -909,6 +912,7 @@ impl SyncedPlayer {
         );
 
         Ok(Self {
+            diagnostics,
             format,
             queue,
             renderer,
@@ -1159,6 +1163,12 @@ impl SyncedPlayer {
         DeviceDelayMs::new(f64::from(delay_ms)).map(|delay| self.set_device_delay(delay))
     }
 
+    /// Observe sync on a host-owned, non-audio thread. No logging is performed
+    /// by this observer; dropping the player still closes the stream normally.
+    pub fn sync_diagnostics(&self) -> SyncDiagnosticsReader {
+        self.diagnostics.clone()
+    }
+
     /// Current static delay in milliseconds.
     pub fn static_delay_ms(&self) -> u16 {
         (self.static_delay_us.load(Ordering::Relaxed) / 1_000) as u16
@@ -1177,6 +1187,7 @@ impl SyncedPlayer {
         format: AudioFormat,
         mut cb_config: CallbackConfig,
         outputs: CallbackOutputs,
+        diagnostics: SyncDiagnosticsReader,
     ) -> Result<Stream, Error> {
         let CallbackOutputs {
             error,
@@ -1208,6 +1219,11 @@ impl SyncedPlayer {
         let mut min_playback_delta_us = u64::MAX;
         let mut last_generation = 0u64;
         let mut stats = CallbackStats::default();
+        let mut observation = SyncDiagnosticsSnapshot {
+            sample_rate,
+            ..Default::default()
+        };
+        let mut previous_callback_at: Option<Instant> = None;
         let initial_gain = cb_config.gain_control.gain();
         let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
         let mut f32_buffer = Vec::<f32>::new();
@@ -1226,6 +1242,20 @@ impl SyncedPlayer {
                 device.build_output_stream(
                     stream_config,
                     move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
+                    let captured_at = Instant::now();
+                    observation.callbacks = observation.callbacks.saturating_add(1);
+                    observation.captured_at = Some(captured_at);
+                    observation.callback_frames = data.len() / channels;
+                    observation.raw_error_us = None;
+                    observation.filtered_error_us = None;
+                    observation.playback_delay_us = info.timestamp().playback.duration_since(info.timestamp().callback).as_micros() as u64;
+                    if let Some(previous) = previous_callback_at {
+                        observation.max_callback_gap_us = observation.max_callback_gap_us.max(captured_at.duration_since(previous).as_micros() as u64);
+                    }
+                    previous_callback_at = Some(captured_at);
+                    // Keep all early returns inside the render operation, so
+                    // silence and contention still publish a fresh observation.
+                    let mut render_callback = || {
                     let mut process_output = |data: &mut [$sample], buffer: &mut Vec<f32>| {
                         if let Some(ref mut cb) = cb_config.process_callback {
                             cb(buffer);
@@ -1330,6 +1360,7 @@ impl SyncedPlayer {
                         | StartState::Armed { .. }
                         | StartState::BoundaryWon { .. } => {}
                     }
+                    observation.generation = generation;
                     if generation != last_generation {
                         log::debug!(
                             "Playback queue generation changed: {} -> {}, queued={:.1}ms, buffers={}, callbacks={}, silent_callbacks={}, underrun_callbacks={}, underrun_frames={}, sync_lock_misses={}, correction_engagements={}",
@@ -1407,6 +1438,7 @@ impl SyncedPlayer {
                         // initialized cursor; before that there is no timeline
                         // position to synchronize yet.
                         stats.sync_lock_misses += 1;
+                        observation.sync_lock_misses = observation.sync_lock_misses.saturating_add(1);
                         if trace_logging && should_log_sample(stats.sync_lock_misses) {
                             log::trace!(
                                 "Audio callback skipped sync: clock lock contended, callback={}, sync_lock_miss={}, queued={:.1}ms, buffers={}, started={}",
@@ -1494,6 +1526,7 @@ impl SyncedPlayer {
                                 };
                                 match outcome {
                                     StartupReanchorOutcome::Applied(cursor_us) => {
+                                        observation.startup_reanchors = observation.startup_reanchors.saturating_add(1);
                                         effective_cursor_us = cursor_us;
                                         reanchor_applied = true;
                                         schedule = CorrectionSchedule::default();
@@ -1597,6 +1630,8 @@ impl SyncedPlayer {
                             // gaplessly (see SyncErrorFilter); plan against
                             // the window floor, never one wake's snapshot.
                             let error_us = error_filter.update(raw_error_us);
+                            observation.raw_error_us = Some(raw_error_us);
+                            observation.filtered_error_us = Some(error_us);
                             let planned_schedule =
                                 planner.plan(error_us, sample_rate, schedule.is_correcting());
                             // Corrections mutate audible frames: engage only
@@ -1740,6 +1775,8 @@ impl SyncedPlayer {
                                         emit_silence(data);
                                         return;
                                     }
+                                    observation.correction_reanchors = observation.correction_reanchors.saturating_add(1);
+                                    observation.last_reanchor_error_us = Some(error_us);
                                     log::debug!(
                                         "Sync reanchor applied: cursor reset to server_time={server_time}µs"
                                     );
@@ -1844,6 +1881,7 @@ impl SyncedPlayer {
                                 if drop_counter == 0 {
                                     // Discard one frame to catch up
                                     if queue.consume_next_frame(channels, sample_rate, None) {
+                                        observation.dropped_frames = observation.dropped_frames.saturating_add(1);
                                         consumed_frames += 1;
                                     }
                                     drop_counter = schedule.drop_every_n_frames;
@@ -1872,6 +1910,7 @@ impl SyncedPlayer {
                                 insert_counter = insert_counter.saturating_sub(1);
                                 if insert_counter == 0 {
                                     insert_counter = schedule.insert_every_n_frames;
+                                    observation.inserted_frames = observation.inserted_frames.saturating_add(1);
                                     for sample in &last_frame {
                                         f32_buffer[out_index] = f32::from_sample(*sample);
                                         out_index += 1;
@@ -1916,6 +1955,7 @@ impl SyncedPlayer {
                     drop(queue_guard);
                     drop(renderer_permit);
                     renderer_for_data.record_callback_underrun(callback_underrun_frames);
+                    observation.underrun_frames = observation.underrun_frames.saturating_add(callback_underrun_frames);
 
                     let recovered = callback_underrun_frames == 0
                         && stats.consecutive_underrun_callbacks > 0;
@@ -2015,6 +2055,11 @@ impl SyncedPlayer {
                             generation,
                         );
                     }
+                    };
+                    render_callback();
+                    observation.insert_every = schedule.insert_every_n_frames;
+                    observation.drop_every = schedule.drop_every_n_frames;
+                    diagnostics.publish(observation);
                     },
                     move |err| {
                         // cpal reports a refused real-time promotion as

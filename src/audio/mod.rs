@@ -11,6 +11,8 @@ pub mod player_contract;
 pub mod pool;
 /// Sync correction planner for drop/insert cadence
 pub mod sync_correction;
+/// Non-blocking observations for host-side sync diagnosis
+pub mod sync_diagnostics;
 /// Synced playback helper using output timestamps
 pub mod synced_player;
 /// Core audio type definitions (Sample, Codec, AudioFormat, AudioBuffer)
@@ -26,6 +28,7 @@ pub use player_contract::{
 };
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};
+pub use sync_diagnostics::{SyncClockDiagnostics, SyncDiagnosticsReader, SyncDiagnosticsSnapshot};
 pub use synced_player::{
     AudioBufferLifetime, DeviceDelayError, DeviceDelayMs, ProcessCallback, ReanchorRequired,
     SyncedPlayer, SyncedPlayerConfig,
