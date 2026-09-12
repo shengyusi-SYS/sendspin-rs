@@ -1242,7 +1242,7 @@ impl RendererOwner {
 
     /// Best-effort diagnostic snapshot. Contention may skip this observation.
     /// Does not wait for the renderer or retry an in-flight telemetry write.
-    /// Use health() for authoritative consumption and finalization reads.
+    /// Use consumed_frames() for consumption alone, or health() for complete evidence.
     pub fn try_health(
         &self,
         scope: PlayerScope,
@@ -1258,6 +1258,18 @@ impl RendererOwner {
         Ok(self
             .try_callback_telemetry_snapshot()
             .map(|telemetry| self.health_snapshot(state, telemetry)))
+    }
+
+    /// Read committed consumption for the current scope without timestamp telemetry.
+    /// Closed scopes remain readable until the owner mints a replacement scope.
+    pub fn consumed_frames(&self, scope: PlayerScope) -> Result<u64, RendererOperationOutcome> {
+        let owner = self.shared.state.lock();
+        let state = owner
+            .current
+            .as_ref()
+            .filter(|state| state.scope == scope)
+            .ok_or(RendererOperationOutcome::StaleScope)?;
+        Ok(state.consumed_frames)
     }
 
     /// Read the current scope's complete typed health snapshot.
@@ -2357,6 +2369,71 @@ mod tests {
         let health = owner.try_health(scope).unwrap().unwrap();
         assert_eq!(health.callback_count(), 1);
         assert_eq!(health.output_timestamps().device_presentation(), 1);
+    }
+
+    #[test]
+    fn consumed_frames_read_does_not_wait_for_inflight_telemetry() {
+        let (owner, scope) = owner_and_scope();
+        owner
+            .try_callback_permit(scope)
+            .unwrap()
+            .record_actual_progress(7, None, 0, 0);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = {
+            let owner = owner.clone();
+            thread::spawn(move || {
+                owner.try_callback_telemetry_with(
+                    scope,
+                    cpal::OutputTimestampSource::DevicePresentation,
+                    false,
+                    || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let reader = {
+            let owner = owner.clone();
+            thread::spawn(move || tx.send(owner.consumed_frames(scope)).unwrap())
+        };
+        let observed = rx.recv_timeout(Duration::from_secs(1));
+        let renderer_available = owner.try_callback_permit(scope).is_some();
+        release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap());
+        reader.join().unwrap();
+        assert_eq!(
+            observed.expect("consumption read must not wait for telemetry"),
+            Ok(7)
+        );
+        assert!(
+            renderer_available,
+            "consumption reader must release the renderer"
+        );
+    }
+
+    #[test]
+    fn consumed_frames_read_preserves_scope_and_final_value() {
+        let (owner, scope) = owner_and_scope();
+        owner
+            .try_callback_permit(scope)
+            .unwrap()
+            .record_actual_progress(7, None, 0, 0);
+        assert_eq!(owner.consumed_frames(scope), Ok(7));
+        assert_eq!(owner.close(scope), RendererOperationOutcome::Applied);
+        assert_eq!(owner.consumed_frames(scope), Ok(7));
+        let terminal = owner.teardown(scope);
+        assert!(terminal.finalization().is_some());
+        assert_eq!(owner.consumed_frames(scope), Ok(7));
+        let replacement = owner.mint_scope().unwrap();
+        assert_eq!(
+            owner.consumed_frames(scope),
+            Err(RendererOperationOutcome::StaleScope)
+        );
+        assert_eq!(owner.consumed_frames(replacement), Ok(0));
     }
 
     #[test]

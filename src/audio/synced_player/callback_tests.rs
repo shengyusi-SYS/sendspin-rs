@@ -126,6 +126,7 @@ impl Harness {
         evidence: Option<cpal::OutputTimestampDiagnostics>,
     ) -> (Vec<f32>, u64) {
         let before = self.owner.health(self.scope).unwrap().consumed_frames();
+        assert_eq!(self.owner.consumed_frames(self.scope).unwrap(), before);
         let mut data = vec![0.0; self.frames * 2];
         let callback = StreamInstant::from_nanos(self.now_us * 1_000);
         (self.callback)(
@@ -140,6 +141,7 @@ impl Harness {
         );
         self.now_us += 10_000;
         let after = self.owner.health(self.scope).unwrap().consumed_frames();
+        assert_eq!(self.owner.consumed_frames(self.scope).unwrap(), after);
         (data, after - before)
     }
 

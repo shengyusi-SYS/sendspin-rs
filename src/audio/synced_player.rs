@@ -1092,6 +1092,11 @@ impl SyncedPlayer {
         self.renderer.health(self.scope)
     }
 
+    /// Read committed consumption without waiting for timestamp telemetry.
+    pub fn consumed_frames(&self) -> Result<u64, RendererOperationOutcome> {
+        self.renderer.consumed_frames(self.scope)
+    }
+
     /// Close queue acceptance and callback consumption without dropping the stream.
     pub fn close(&self) -> RendererOperationOutcome {
         self.renderer.close(self.scope)
