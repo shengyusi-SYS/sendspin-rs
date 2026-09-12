@@ -269,6 +269,10 @@ impl Deref for QueuedAudioBuffer {
 
 struct PlaybackQueue {
     queue: VecDeque<QueuedAudioBuffer>,
+    /// Complete frames in `queue`; the current buffer is counted from its index.
+    pending_frames: usize,
+    /// Conservative maximum end of pending buffers, used only for fast append.
+    pending_end_upper_bound: Option<i128>,
     current: Option<QueuedAudioBuffer>,
     index: usize,
     /// Current playback position in **server-time microseconds**. Periodically
@@ -297,6 +301,8 @@ impl PlaybackQueue {
     fn new() -> Self {
         Self {
             queue: VecDeque::new(),
+            pending_frames: 0,
+            pending_end_upper_bound: None,
             current: None,
             index: 0,
             cursor_us: 0,
@@ -310,6 +316,8 @@ impl PlaybackQueue {
 
     fn clear(&mut self) {
         self.queue.clear();
+        self.pending_frames = 0;
+        self.pending_end_upper_bound = None;
         self.current = None;
         self.index = 0;
         self.cursor_us = 0;
@@ -341,6 +349,30 @@ impl PlaybackQueue {
             self.initialized = true;
         }
 
+        // Enqueue validation guarantees complete frames in the fixed player format.
+        let frames = buffer.samples.len() / usize::from(buffer.format.channels);
+        let new_end = buffer_end_zone_us(&buffer);
+        let can_append = self.queue.is_empty()
+            || (self
+                .queue
+                .back()
+                .is_some_and(|tail| tail.timestamp <= buffer.timestamp)
+                && self
+                    .pending_end_upper_bound
+                    .is_some_and(|end| i128::from(buffer.timestamp) >= end));
+        if can_append {
+            self.pending_frames += frames;
+            self.pending_end_upper_bound = Some(
+                self.pending_end_upper_bound
+                    .map_or(new_end, |end| end.max(new_end)),
+            );
+            self.queue.push_back(QueuedAudioBuffer {
+                buffer,
+                _lifetime: lifetime,
+            });
+            return;
+        }
+
         // When the server rebases its timeline backward (e.g. after event loop
         // starvation), new chunks arrive with timestamps that overlap chunks
         // already in the queue. Remove all overlapping buffers to prevent
@@ -359,13 +391,21 @@ impl PlaybackQueue {
         // discarded ~34% of all 44.1kHz audio (heard as continuous popping).
         let rate = i64::from(buffer.format.sample_rate.max(1));
         let frame_us = (1_000_000 + rate - 1) / rate;
-        let new_end = buffer_end_zone_us(&buffer);
+        let mut retained_frames = 0;
+        let mut retained_end: Option<i128> = None;
         self.queue.retain(|b| {
             let existing_end = buffer_end_zone_us(b);
             let overlap_us =
                 new_end.min(existing_end) - i128::from(buffer.timestamp.max(b.timestamp));
-            overlap_us < i128::from(frame_us)
+            let keep = overlap_us < i128::from(frame_us);
+            if keep {
+                retained_frames += b.samples.len() / usize::from(b.format.channels);
+                retained_end = Some(retained_end.map_or(existing_end, |end| end.max(existing_end)));
+            }
+            keep
         });
+        self.pending_frames = retained_frames + frames;
+        self.pending_end_upper_bound = Some(retained_end.map_or(new_end, |end| end.max(new_end)));
 
         let pos = self
             .queue
@@ -387,6 +427,15 @@ impl PlaybackQueue {
         }
     }
 
+    fn pop_pending(&mut self) -> Option<QueuedAudioBuffer> {
+        let buffer = self.queue.pop_front()?;
+        self.pending_frames -= buffer.samples.len() / usize::from(buffer.format.channels);
+        if self.queue.is_empty() {
+            self.pending_end_upper_bound = None;
+        }
+        Some(buffer)
+    }
+
     fn consume_next_frame(
         &mut self,
         channels: usize,
@@ -402,7 +451,7 @@ impl PlaybackQueue {
             if self.initialized {
                 while let Some(front) = self.queue.front() {
                     if buffer_end_zone_us(front) < i128::from(self.cursor_us) {
-                        let _ = self.queue.pop_front();
+                        let _ = self.pop_pending();
                         continue;
                     }
                     break;
@@ -412,7 +461,7 @@ impl PlaybackQueue {
             // Pop buffers until we find one with remaining samples past the
             // cursor, or the queue is empty.
             loop {
-                self.current = self.queue.pop_front();
+                self.current = self.pop_pending();
                 self.index = 0;
 
                 // Skip past samples that are behind the cursor. This handles
@@ -522,12 +571,7 @@ impl PlaybackQueue {
         let current_frames = self.current.as_ref().map_or(0, |current| {
             current.samples.len().saturating_sub(self.index) / channels
         });
-        let queued_frames = self
-            .queue
-            .iter()
-            .map(|buffer| buffer.samples.len() / channels)
-            .sum::<usize>();
-        current_frames + queued_frames
+        current_frames + self.pending_frames
     }
 
     fn queued_duration_us(&self, channels: usize, sample_rate: u32) -> u64 {
@@ -1019,8 +1063,7 @@ impl SyncedPlayer {
 
         // Snapshot log fields under the lock but log after dropping it: the
         // audio callback contends on this lock, and logging can block on I/O.
-        // The O(buffers) depth walk runs only for sampled, trace-enabled
-        // enqueues.
+        // Capture log fields only for sampled, trace-enabled enqueues.
         let trace_fields = {
             if log::log_enabled!(log::Level::Trace) && should_log_sample(queue.enqueue_count) {
                 Some((
@@ -1488,9 +1531,7 @@ fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
                         } else {
                             None
                         };
-                        // Queue depth costs a walk over every queued buffer,
-                        // so only measure it when a log line below can print
-                        // it.
+                        // Capture queue depth only when a log line below can print it.
                         let (queued_us, queued_buffers) = if debug_logging {
                             (
                                 queue.queued_duration_us(channels, sample_rate),
@@ -3387,6 +3428,94 @@ mod tests {
             validate_enqueue_buffer(&overflow.format, &overflow),
             Err(EnqueueOutcome::InvalidBuffer)
         );
+    }
+
+    #[test]
+    fn queue_capacity_tracks_pending_current_and_clear() {
+        let buffer = |timestamp, samples: &[i32]| AudioBuffer {
+            timestamp,
+            samples: Arc::from(samples),
+            format: AudioFormat {
+                sample_rate: 1_000,
+                ..test_format_mono()
+            },
+        };
+        let mut queue = PlaybackQueue::new();
+        queue.push(buffer(0, &[1, 2, 3, 4]));
+        queue.push(buffer(4_000, &[5, 6, 7, 8]));
+        assert_eq!(queue.queued_frames(1), 8);
+        for sample in [1, 2, 3] {
+            assert_eq!(queue.next_frame(1, 1_000), Some(vec![sample]));
+        }
+        assert_eq!(queue.queued_frames(1), 5);
+        for sample in [4, 5] {
+            assert_eq!(queue.next_frame(1, 1_000), Some(vec![sample]));
+        }
+        assert_eq!(queue.queued_frames(1), 3);
+        queue.clear();
+        assert_eq!(queue.queued_frames(1), 0);
+        queue.push(buffer(10_000, &[9, 10]));
+        assert_eq!(queue.queued_frames(1), 2);
+        for sample in [9, 10] {
+            assert_eq!(queue.next_frame(1, 1_000), Some(vec![sample]));
+        }
+        assert_eq!(queue.queued_frames(1), 0);
+    }
+
+    #[test]
+    fn queue_capacity_and_pcm_follow_replacement_and_cursor() {
+        // Expected PCM comes from the input ranges, independently of queue accounting.
+        let cases: &[(&str, &[(i64, &[i32])], i64, usize, &[i32])] = &[
+            (
+                "out of order",
+                &[(4_000, &[5, 6, 7, 8]), (0, &[1, 2, 3, 4])],
+                0,
+                8,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            (
+                "overlap replacement",
+                &[(0, &[1, 2, 3, 4]), (2_000, &[20, 21, 22, 23])],
+                0,
+                4,
+                &[20, 21, 22, 23],
+            ),
+            (
+                "stale pending",
+                &[(0, &[1, 2]), (4_000, &[5, 6, 7])],
+                3_000,
+                5,
+                &[5, 6, 7],
+            ),
+            (
+                "skip into current",
+                &[(0, &[1, 2, 3, 4]), (4_000, &[5, 6])],
+                2_000,
+                6,
+                &[3, 4, 5, 6],
+            ),
+        ];
+        for &(name, buffers, cursor_us, before_frames, expected) in cases {
+            let mut queue = PlaybackQueue::new();
+            for &(timestamp, samples) in buffers {
+                queue.push(AudioBuffer {
+                    timestamp,
+                    samples: Arc::from(samples),
+                    format: AudioFormat {
+                        sample_rate: 1_000,
+                        ..test_format_mono()
+                    },
+                });
+            }
+            queue.cursor_us = cursor_us;
+            assert_eq!(queue.queued_frames(1), before_frames, "{name}");
+            for (index, &sample) in expected.iter().enumerate() {
+                assert_eq!(queue.next_frame(1, 1_000), Some(vec![sample]), "{name}");
+                assert_eq!(queue.queued_frames(1), expected.len() - index - 1, "{name}");
+            }
+            assert_eq!(queue.next_frame(1, 1_000), None, "{name}");
+            assert_eq!(queue.queued_frames(1), 0, "{name}");
+        }
     }
 
     #[test]

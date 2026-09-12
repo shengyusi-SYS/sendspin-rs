@@ -67,22 +67,24 @@ impl Harness {
             bit_depth: 32,
             codec_header: None,
         };
-        let frame_count = sample_rate as usize * 12;
-        assert!(matches!(
-            owner.enqueue_with_actual(scope, frame_count, || {
-                let mut q = queue.lock();
-                q.push(AudioBuffer {
-                    timestamp: 1_000_000,
-                    samples: (1..=frame_count)
-                        .flat_map(|frame| [frame as i32 * 1024; 2])
-                        .collect::<Vec<_>>()
-                        .into(),
-                    format: format.clone(),
-                });
-                (q.queued_frames(2), q.buffer_count())
-            }),
-            EnqueueOutcome::Accepted { .. }
-        ));
+        let chunk_frames = sample_rate as usize * 3;
+        for chunk in 0..4 {
+            assert!(matches!(
+                owner.enqueue_with_actual(scope, chunk_frames, || {
+                    let mut q = queue.lock();
+                    q.push(AudioBuffer {
+                        timestamp: 1_000_000 + chunk as i64 * 3_000_000,
+                        samples: (chunk * chunk_frames + 1..=(chunk + 1) * chunk_frames)
+                            .flat_map(|frame| [frame as i32 * 1024; 2])
+                            .collect::<Vec<_>>()
+                            .into(),
+                        format: format.clone(),
+                    });
+                    (q.queued_frames(2), q.buffer_count())
+                }),
+                EnqueueOutcome::Accepted { .. }
+            ));
+        }
         assert_eq!(
             owner.arm_scheduled_start(scope, 1_000_000),
             ScheduledArmOutcome::Armed
@@ -269,7 +271,18 @@ fn callback_valid_and_unspecified_timestamps_start_and_remain_aligned() {
             OutputTimestampSource::DevicePresentation,
             OutputTimestampSource::Unspecified,
         ] {
-            Harness::new(rate).warm(source);
+            let mut h = Harness::new(rate);
+            h.warm(source);
+            let mut next_frame = rate as usize * 2 + 1;
+            for _ in 0..200 {
+                let (data, consumed) = h.render(source, 167_000);
+                assert_eq!(consumed, h.frames as u64);
+                for stereo in data.chunks_exact(2) {
+                    let expected = next_frame as f32 / 2_097_152.0;
+                    assert_eq!(stereo, [expected, expected]);
+                    next_frame += 1;
+                }
+            }
         }
     }
 }
