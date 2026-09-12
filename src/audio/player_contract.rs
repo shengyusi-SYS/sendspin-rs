@@ -1645,14 +1645,6 @@ pub(crate) struct RendererCallbackPermit<'a> {
 }
 
 impl RendererCallbackPermit<'_> {
-    pub(crate) fn start_state(&self) -> StartState {
-        self.owner
-            .current
-            .as_ref()
-            .expect("callback permit keeps current scope installed")
-            .start_state
-    }
-
     pub(crate) fn scheduled_start(
         &mut self,
         presentation_zone_us: Option<i64>,

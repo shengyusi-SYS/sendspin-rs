@@ -238,11 +238,16 @@ fn callback_access_failure_reports_silence_and_retains_evidence_after_recovery()
         assert_eq!(snapshot.renderer_access_misses, u64::from(block_renderer));
         assert_eq!(snapshot.queue_lock_misses, u64::from(!block_renderer));
         assert_eq!(snapshot.last_access_miss_callback, before.callbacks + 1);
-        assert_eq!(snapshot.last_access_miss_phase, Some("timing_snapshot"));
+        let missed_phase = if block_renderer {
+            "render"
+        } else {
+            "timing_snapshot"
+        };
+        assert_eq!(snapshot.last_access_miss_phase, Some(missed_phase));
         assert_eq!(snapshot.underrun_frames, 0); // This queue never ran dry.
         assert_eq!(snapshot.output_xrun_count, Some(3));
         assert_eq!(snapshot.output_buffer_size_frames, Some(1024));
-        assert_eq!(snapshot.raw_error_us, None);
+        assert_eq!(snapshot.raw_error_us.is_some(), block_renderer);
 
         let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
         assert!(data.iter().all(|sample| *sample > 0.0));
@@ -250,7 +255,7 @@ fn callback_access_failure_reports_silence_and_retains_evidence_after_recovery()
         let recovered = h.diagnostics.snapshot();
         assert_eq!(recovered.access_silence_frames, 441);
         assert_eq!(recovered.last_access_miss_callback, snapshot.callbacks);
-        assert_eq!(recovered.last_access_miss_phase, Some("timing_snapshot"));
+        assert_eq!(recovered.last_access_miss_phase, Some(missed_phase));
         assert_eq!(recovered.silent_frames, snapshot.silent_frames);
         assert_eq!(recovered.output_xrun_count, None); // Unsupported is not zero.
         assert_eq!(recovered.output_buffer_size_frames, None);

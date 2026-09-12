@@ -682,6 +682,47 @@ fn try_callback_queue<T>(
     Some(operation(&mut queue, &mut permit))
 }
 
+fn record_callback_access_failure(
+    renderer: &RendererOwner,
+    silent_frames: usize,
+    phase: CallbackQueuePhase,
+    renderer_unavailable: bool,
+    observation: &mut SyncDiagnosticsSnapshot,
+) {
+    let counter = if renderer_unavailable {
+        &mut observation.renderer_access_misses
+    } else {
+        &mut observation.queue_lock_misses
+    };
+    *counter = counter.saturating_add(1);
+    observation.access_silence_frames = observation
+        .access_silence_frames
+        .saturating_add(silent_frames as u64);
+    observation.last_access_miss_callback = observation.callbacks;
+    observation.last_access_miss_phase = Some(phase.label());
+    renderer.record_callback_underrun(silent_frames as u64);
+}
+
+fn try_callback_timing_queue<T>(
+    renderer: &RendererOwner,
+    queue: &Mutex<PlaybackQueue>,
+    silent_frames: usize,
+    observation: &mut SyncDiagnosticsSnapshot,
+    operation: impl FnOnce(&PlaybackQueue) -> T,
+) -> Option<T> {
+    let Some(queue) = queue.try_lock() else {
+        record_callback_access_failure(
+            renderer,
+            silent_frames,
+            CallbackQueuePhase::TimingSnapshot,
+            false,
+            observation,
+        );
+        return None;
+    };
+    Some(operation(&queue))
+}
+
 fn try_callback_queue_guards<'a>(
     renderer: &'a RendererOwner,
     scope: PlayerScope,
@@ -690,27 +731,13 @@ fn try_callback_queue_guards<'a>(
     phase: CallbackQueuePhase,
     observation: &mut SyncDiagnosticsSnapshot,
 ) -> Option<(RendererCallbackPermit<'a>, MutexGuard<'a, PlaybackQueue>)> {
-    let mut record_failure = |renderer_unavailable: bool| {
-        let counter = if renderer_unavailable {
-            &mut observation.renderer_access_misses
-        } else {
-            &mut observation.queue_lock_misses
-        };
-        *counter = counter.saturating_add(1);
-        observation.access_silence_frames = observation
-            .access_silence_frames
-            .saturating_add(silent_frames as u64);
-        observation.last_access_miss_callback = observation.callbacks;
-        observation.last_access_miss_phase = Some(phase.label());
-        renderer.record_callback_underrun(silent_frames as u64);
-    };
     let Some(permit) = renderer.try_callback_permit(scope) else {
-        record_failure(true);
+        record_callback_access_failure(renderer, silent_frames, phase, true, observation);
         return None;
     };
     let Some(queue) = queue.try_lock() else {
         drop(permit);
-        record_failure(false);
+        record_callback_access_failure(renderer, silent_frames, phase, false, observation);
         return None;
     };
     Some((permit, queue))
@@ -1449,60 +1476,43 @@ fn make_output_callback<T: cpal::SizedSample + cpal::FromSample<f32>>(
             // rechecked before consuming force_reanchor so a clear()
             // racing with this callback cannot clear the next startup's
             // one-shot handoff.
-            let Some((
-                start_state,
-                generation,
-                cursor_us,
-                force_reanchor,
-                delay_us,
-                queued_us,
-                queued_buffers,
-            )) = try_callback_queue(
-                &renderer_for_data,
-                scope,
-                &queue,
-                frames,
-                CallbackQueuePhase::TimingSnapshot,
-                &mut observation,
-                |queue, permit| {
-                    let cursor = if queue.initialized {
-                        Some(queue.cursor_us)
-                    } else {
-                        None
-                    };
-                    // Queue depth costs a walk over every queued buffer,
-                    // so only measure it when a log line below can print
-                    // it.
-                    let (queued_us, queued_buffers) = if debug_logging {
+            let Some((generation, cursor_us, force_reanchor, delay_us, queued_us, queued_buffers)) =
+                try_callback_timing_queue(
+                    &renderer_for_data,
+                    &queue,
+                    frames,
+                    &mut observation,
+                    |queue| {
+                        let cursor = if queue.initialized {
+                            Some(queue.cursor_us)
+                        } else {
+                            None
+                        };
+                        // Queue depth costs a walk over every queued buffer,
+                        // so only measure it when a log line below can print
+                        // it.
+                        let (queued_us, queued_buffers) = if debug_logging {
+                            (
+                                queue.queued_duration_us(channels, sample_rate),
+                                queue.buffer_count(),
+                            )
+                        } else {
+                            (0, 0)
+                        };
                         (
-                            queue.queued_duration_us(channels, sample_rate),
-                            queue.buffer_count(),
+                            queue.generation,
+                            cursor,
+                            queue.force_reanchor,
+                            cb_config.static_delay_us.load(Ordering::Relaxed),
+                            queued_us,
+                            queued_buffers,
                         )
-                    } else {
-                        (0, 0)
-                    };
-                    (
-                        permit.start_state(),
-                        queue.generation,
-                        cursor,
-                        queue.force_reanchor,
-                        cb_config.static_delay_us.load(Ordering::Relaxed),
-                        queued_us,
-                        queued_buffers,
-                    )
-                },
-            )
+                    },
+                )
             else {
                 emit_silence(data);
                 return;
             };
-            // This first branch is an advisory snapshot only. Public
-            // arm/clear operations may legally change the state before
-            // the render permit is acquired below, so the render permit
-            // remains the sole authority for the transition decision.
-            match start_state {
-                StartState::Idle | StartState::Armed { .. } | StartState::BoundaryWon { .. } => {}
-            }
             observation.generation = generation;
             if generation != last_generation {
                 log::debug!(
@@ -2239,14 +2249,14 @@ mod tests {
     use super::{
         abort_before_start_with_queue, canonical_presentation_zone_us, classify_output_timestamp,
         default_renderer_limits, set_device_delay_state, teardown_with_queue, try_callback_queue,
-        validate_enqueue_buffer, validate_output_format, windows_default_buffer_frames,
-        CallbackQueuePhase, DeviceDelayError, DeviceDelayMs, PlaybackQueue,
-        SyncDiagnosticsSnapshot, MAX_STATIC_DELAY_MS,
+        try_callback_timing_queue, validate_enqueue_buffer, validate_output_format,
+        windows_default_buffer_frames, CallbackQueuePhase, DeviceDelayError, DeviceDelayMs,
+        PlaybackQueue, SyncDiagnosticsSnapshot, MAX_STATIC_DELAY_MS,
     };
     use crate::audio::{
         AudioBuffer, AudioFormat, Codec, EnqueueOutcome, PlayerScope, PreStartAbortOutcome,
         RendererFault, RendererOperationOutcome, RendererOwner, RendererQueueLimits,
-        ScheduledArmOutcome, ScheduledStartOutcome, StartState, TerminalOutcome,
+        ScheduledArmOutcome, ScheduledStartOutcome, TerminalOutcome,
     };
     use cpal::Sample;
     use parking_lot::Mutex;
@@ -2669,23 +2679,38 @@ mod tests {
     }
 
     #[test]
+    fn timing_snapshot_reads_queue_during_renderer_contention() {
+        let (owner, scope, queue) = renderer_harness();
+        assert!(matches!(
+            enqueue_harness(&owner, scope, &queue, mono_buffer(0, 4)),
+            EnqueueOutcome::Accepted { .. }
+        ));
+        let permit = owner.try_callback_permit(scope).unwrap();
+        let mut observation = SyncDiagnosticsSnapshot::default();
+        let snapshot = try_callback_timing_queue(&owner, &queue, 1, &mut observation, |queue| {
+            (queue.cursor_us, queue.generation)
+        });
+        drop(permit);
+        assert_eq!(snapshot, Some((0, 0)));
+        assert_eq!(observation.access_silence_frames, 0);
+    }
+
+    #[test]
     fn scheduled_start_timing_snapshot_changes_are_advisory() {
         let (owner, idle_scope, queue) = renderer_harness();
         assert!(matches!(
             enqueue_harness(&owner, idle_scope, &queue, mono_buffer(0, 4)),
             EnqueueOutcome::Accepted { .. }
         ));
-        let idle_snapshot = try_callback_queue(
+        let idle_snapshot = try_callback_timing_queue(
             &owner,
-            idle_scope,
             &queue,
             1,
-            CallbackQueuePhase::TimingSnapshot,
             &mut SyncDiagnosticsSnapshot::default(),
-            |_queue, permit| permit.start_state(),
+            |queue| (queue.cursor_us, queue.generation),
         )
         .unwrap();
-        assert_eq!(idle_snapshot, StartState::Idle);
+        assert_eq!(idle_snapshot, (0, 0));
         assert_eq!(
             owner.arm_scheduled_start(idle_scope, 100),
             ScheduledArmOutcome::Armed
@@ -2718,22 +2743,15 @@ mod tests {
             owner.arm_scheduled_start(armed_scope, 200),
             ScheduledArmOutcome::Armed
         );
-        let armed_snapshot = try_callback_queue(
+        let armed_snapshot = try_callback_timing_queue(
             &owner,
-            armed_scope,
             &queue,
             1,
-            CallbackQueuePhase::TimingSnapshot,
             &mut SyncDiagnosticsSnapshot::default(),
-            |_queue, permit| permit.start_state(),
+            |queue| (queue.cursor_us, queue.generation),
         )
         .unwrap();
-        assert_eq!(
-            armed_snapshot,
-            StartState::Armed {
-                start_at_zone_us: 200,
-            }
-        );
+        assert_eq!(armed_snapshot, (0, 1));
         {
             let mut actual_queue = queue.lock();
             assert_eq!(
