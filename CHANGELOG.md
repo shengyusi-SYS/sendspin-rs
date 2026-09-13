@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Play mono PCM on stereo-only outputs at the same sample rate by duplicating
+  each input frame to left and right. Native mono remains preferred; renderer
+  timestamps, frame consumption and drift correction stay in the input domain.
+
 ### Added
 
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,

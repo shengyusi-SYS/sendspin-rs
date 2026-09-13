@@ -200,7 +200,50 @@ fn validate_enqueue_buffer(
     Ok((frames, duration_us))
 }
 
-fn preflight_device_output_format(device: &Device, format: &AudioFormat) -> Result<(), OpenError> {
+fn select_output_channels(
+    input: u16,
+    supported: impl Iterator<Item = u16>,
+) -> Result<u16, OpenError> {
+    let mut exact = false;
+    let mut stereo = false;
+    for channels in supported {
+        exact |= channels == input;
+        stereo |= channels == 2;
+    }
+    if exact {
+        Ok(input)
+    } else if input == 1 && stereo {
+        Ok(2)
+    } else {
+        Err(OpenError::UnsupportedFormat)
+    }
+}
+
+// Render in the input frame domain, then map into the physical output buffer.
+fn render_output_channels<T: cpal::Sample>(
+    data: &mut [T],
+    mono_to_stereo: bool,
+    render: impl FnOnce(&mut [T]),
+) {
+    if !mono_to_stereo {
+        render(data);
+        return;
+    }
+    let frames = data.len() / 2;
+    render(&mut data[..frames]);
+    // Expand backwards so unread mono samples are never overwritten. No
+    // allocation or extra renderer/queue access occurs on the audio thread.
+    for frame in (0..frames).rev() {
+        let sample = data[frame];
+        data[2 * frame] = sample;
+        data[2 * frame + 1] = sample;
+    }
+    if data.len() % 2 != 0 {
+        *data.last_mut().unwrap() = T::EQUILIBRIUM;
+    }
+}
+
+fn preflight_device_output_format(device: &Device, format: &AudioFormat) -> Result<u16, OpenError> {
     let default_config = device
         .default_output_config()
         .map_err(|error| OpenError::Backend(OutputBackendError::new(error.to_string())))?;
@@ -222,17 +265,17 @@ fn preflight_device_output_format(device: &Device, format: &AudioFormat) -> Resu
     }
     let supported = device
         .supported_output_configs()
-        .map_err(|error| OpenError::Backend(OutputBackendError::new(error.to_string())))?
-        .any(|range| {
-            range.channels() == u16::from(format.channels)
-                && range.sample_format() == default_config.sample_format()
-                && range.min_sample_rate() <= format.sample_rate
-                && format.sample_rate <= range.max_sample_rate()
-        });
-    if !supported {
-        return Err(OpenError::UnsupportedFormat);
-    }
-    Ok(())
+        .map_err(|error| OpenError::Backend(OutputBackendError::new(error.to_string())))?;
+    select_output_channels(
+        u16::from(format.channels),
+        supported
+            .filter(|range| {
+                range.sample_format() == default_config.sample_format()
+                    && range.min_sample_rate() <= format.sample_rate
+                    && format.sample_rate <= range.max_sample_rate()
+            })
+            .map(|range| range.channels()),
+    )
 }
 
 /// Frames for [`WINDOWS_DEFAULT_BUFFER_MS`] at `sample_rate`.
@@ -927,10 +970,10 @@ impl SyncedPlayer {
     ) -> Result<Self, OpenError> {
         validate_output_format(&format)?;
         let device = config.device;
-        preflight_device_output_format(&device, &format)?;
+        let output_channels = preflight_device_output_format(&device, &format)?;
 
         let stream_config = StreamConfig {
-            channels: format.channels as u16,
+            channels: output_channels,
             sample_rate: cpal::SampleRate::from(format.sample_rate),
             buffer_size: match config.buffer_size {
                 Some(frames) => cpal::BufferSize::Fixed(frames),
@@ -1300,7 +1343,8 @@ impl SyncedPlayer {
             .map_err(|e| Error::Output(e.to_string()))?;
         let mut stream_config = device_config.config();
         stream_config.buffer_size = config.buffer_size;
-        stream_config.channels = format.channels.into();
+        stream_config.channels = config.channels;
+        let mono_to_stereo = format.channels == 1 && config.channels == 2;
         stream_config.sample_rate = format.sample_rate;
 
         macro_rules! output_stream {
@@ -1319,13 +1363,15 @@ impl SyncedPlayer {
                     .build_output_stream(
                         stream_config,
                         move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
-                            callback(
-                                data,
-                                info.timestamp(),
-                                info.timestamp_source(),
-                                info.timestamp_diagnostics(),
-                                Instant::now(),
-                            );
+                            render_output_channels(data, mono_to_stereo, |input| {
+                                callback(
+                                    input,
+                                    info.timestamp(),
+                                    info.timestamp_source(),
+                                    info.timestamp_diagnostics(),
+                                    Instant::now(),
+                                );
+                            });
                         },
                         move |err| {
                             // cpal reports a refused real-time promotion as
@@ -2304,6 +2350,24 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{mpsc, Arc};
     use std::thread;
+
+    #[test]
+    fn mono_output_prefers_native_and_falls_back_only_to_stereo() {
+        assert_eq!(
+            super::select_output_channels(1, [2, 1].into_iter()).unwrap(),
+            1
+        );
+        assert_eq!(
+            super::select_output_channels(1, [2].into_iter()).unwrap(),
+            2
+        );
+        assert!(super::select_output_channels(1, [6].into_iter()).is_err());
+        assert!(super::select_output_channels(2, [1].into_iter()).is_err());
+        assert_eq!(
+            super::select_output_channels(2, [2].into_iter()).unwrap(),
+            2
+        );
+    }
 
     /// Standard test format: 48kHz stereo 24-bit PCM.
     fn test_format() -> AudioFormat {

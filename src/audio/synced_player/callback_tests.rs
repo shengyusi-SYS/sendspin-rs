@@ -50,6 +50,10 @@ struct Harness {
 
 impl Harness {
     fn new(sample_rate: u32) -> Self {
+        Self::with_channels(sample_rate, 2)
+    }
+
+    fn with_channels(sample_rate: u32, channels: u8) -> Self {
         let origin = Instant::now(); // Arbitrary epoch; every later instant is injected.
         let clock = Arc::new(Mutex::new(ClockSync::new_same_clock(Arc::new(
             CallbackClock(origin),
@@ -63,7 +67,7 @@ impl Harness {
         let format = AudioFormat {
             codec: Codec::Pcm,
             sample_rate,
-            channels: 2,
+            channels,
             bit_depth: 32,
             codec_header: None,
         };
@@ -75,12 +79,14 @@ impl Harness {
                     q.push(AudioBuffer {
                         timestamp: 1_000_000 + chunk as i64 * 3_000_000,
                         samples: (chunk * chunk_frames + 1..=(chunk + 1) * chunk_frames)
-                            .flat_map(|frame| [frame as i32 * 1024; 2])
+                            .flat_map(|frame| {
+                                std::iter::repeat_n(frame as i32 * 1024, channels as usize)
+                            })
                             .collect::<Vec<_>>()
                             .into(),
                         format: format.clone(),
                     });
-                    (q.queued_frames(2), q.buffer_count())
+                    (q.queued_frames(channels as usize), q.buffer_count())
                 }),
                 EnqueueOutcome::Accepted { .. }
             ));
@@ -91,7 +97,7 @@ impl Harness {
         );
         let diagnostics = SyncDiagnosticsReader::new(clock.clone());
         let static_delay_us = Arc::new(AtomicU64::new(0));
-        let callback = make_output_callback::<f32>(
+        let mut callback = make_output_callback::<f32>(
             queue.clone(),
             clock,
             format,
@@ -105,7 +111,11 @@ impl Harness {
             diagnostics.clone(),
         );
         Self {
-            callback: Box::new(callback),
+            callback: Box::new(move |data, timestamp, source, evidence, instant| {
+                render_output_channels(data, channels == 1, |input| {
+                    callback(input, timestamp, source, evidence, instant)
+                });
+            }),
             origin,
             now_us: 823_000, // First valid presentation is 990ms; start is 1000ms.
             frames: sample_rate as usize / 100,
@@ -491,4 +501,19 @@ fn callback_fallback_cannot_poison_explicit_reanchor_latency_floor() {
         assert_eq!(snapshot.raw_error_us, Some(0));
         assert_eq!(snapshot.correction_reanchors, 0);
     }
+}
+
+#[test]
+fn mono_output_preserves_stereo_frame_timing_and_consumption() {
+    let mut mono = Harness::with_channels(48_000, 1);
+    let mut stereo = Harness::new(48_000);
+    for _ in 0..220 {
+        let (actual, consumed) = mono.render(OutputTimestampSource::DevicePresentation, 167_000);
+        let (expected, expected_consumed) =
+            stereo.render(OutputTimestampSource::DevicePresentation, 167_000);
+        assert_eq!(actual, expected);
+        assert_eq!(consumed, expected_consumed);
+    }
+    assert_eq!(mono.diagnostics.snapshot().inserted_frames, 0);
+    assert_eq!(mono.diagnostics.snapshot().dropped_frames, 0);
 }
