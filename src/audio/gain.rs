@@ -29,6 +29,11 @@ fn volume_to_gain(volume: u8) -> (u8, f32) {
 }
 
 impl GainControl {
+    /// Inner allocation layout; clones share this single allocation.
+    pub(crate) fn shared_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<GainState>()
+    }
+
     /// Create a new `GainControl` at the given volume and mute state.
     pub fn new(volume: u8, muted: bool) -> Self {
         let (clamped, gain) = volume_to_gain(volume);

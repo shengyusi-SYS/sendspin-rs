@@ -1,9 +1,12 @@
 // ABOUTME: Scope-fenced bounded renderer and shared terminal finalization contracts
 // ABOUTME: Keeps queue accounting, health, and teardown races typed and observable
 
+use crate::audio::synced_player::ingress::ControlGate;
 use cpal::traits::StreamTrait;
 use cpal::{OutputTimestampSource, Stream};
-use parking_lot::{Condvar, Mutex, MutexGuard};
+#[cfg(test)]
+use parking_lot::MutexGuard;
+use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -269,7 +272,7 @@ pub enum TerminalWinner {
     PreStartAbort,
 }
 
-/// Proof published only after the owned stream has been released.
+/// Proof published after owned stream and preparation resources are released.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalAck {
     stream_released: bool,
@@ -293,12 +296,12 @@ impl TerminalAck {
 pub enum TerminalState {
     /// No terminal request has won.
     Open,
-    /// One request is dropping the owned stream.
+    /// One request is releasing the stream and preparation resources.
     Finalizing {
         /// The sole finalizer winner.
         winner: TerminalWinner,
     },
-    /// The stream has been dropped and the final ack is stable.
+    /// Owned resources have been released and the final ack is stable.
     Finalized {
         /// The sole finalizer winner.
         winner: TerminalWinner,
@@ -538,14 +541,14 @@ struct ScopeState {
     queued_buffers: usize,
     high_water_frames: usize,
     high_water_buffers: usize,
-    consumed_frames: u64,
+    consumed_frames: Arc<AtomicU64>,
     last_boundary: Option<i64>,
     fault: Option<RendererFault>,
     terminal: Option<RendererTerminal>,
     accepting: bool,
     terminal_state: TerminalState,
     terminal_waiters: usize,
-    start_state: StartState,
+    control: Arc<ControlGate>,
 }
 
 impl ScopeState {
@@ -556,41 +559,49 @@ impl ScopeState {
             queued_buffers: 0,
             high_water_frames: 0,
             high_water_buffers: 0,
-            consumed_frames: 0,
+            consumed_frames: Arc::new(AtomicU64::new(0)),
             last_boundary: None,
             fault: None,
             terminal: None,
             accepting: true,
             terminal_state: TerminalState::Open,
             terminal_waiters: 0,
-            start_state: StartState::Idle,
+            control: Arc::new(ControlGate::default()),
         }
     }
 
-    fn scheduled_start(&mut self, presentation_zone_us: Option<i64>) -> ScheduledStartOutcome {
-        match self.start_state {
-            StartState::Idle => ScheduledStartOutcome::Unscheduled,
-            StartState::Armed { start_at_zone_us } => {
-                if presentation_zone_us.is_none_or(|now| now < start_at_zone_us) {
-                    return ScheduledStartOutcome::Waiting { start_at_zone_us };
-                }
-                self.start_state = StartState::BoundaryWon { start_at_zone_us };
-                self.last_boundary = Some(start_at_zone_us);
-                ScheduledStartOutcome::BoundaryWon { start_at_zone_us }
-            }
-            StartState::BoundaryWon { start_at_zone_us } => {
-                ScheduledStartOutcome::Started { start_at_zone_us }
-            }
-        }
+    #[cfg(test)]
+    fn scheduled_start(&self, presentation_zone_us: Option<i64>) -> ScheduledStartOutcome {
+        // The legacy test permit uses the production scope's sole start authority.
+        self.control
+            .begin_callback()
+            .decide_start(presentation_zone_us)
     }
 
     fn record_trusted_boundary(&mut self, boundary_zone_us: i64) {
-        match self.start_state {
-            StartState::Idle => self.last_boundary = Some(boundary_zone_us),
-            StartState::Armed { .. } => {}
-            StartState::BoundaryWon { start_at_zone_us } => {
-                self.last_boundary = Some(start_at_zone_us);
+        if matches!(self.control.start_state(), StartState::Idle) {
+            self.last_boundary = Some(boundary_zone_us);
+        }
+    }
+
+    fn presentation_boundary(&self) -> Option<i64> {
+        match self.control.start_state() {
+            StartState::BoundaryWon { start_at_zone_us } => Some(start_at_zone_us),
+            _ => self.last_boundary,
+        }
+    }
+
+    // Owner/control thread only. A device invocation never waits on this lease.
+    // Revocation and unstarted phase reset share one CAS before the caller clears
+    // its canonical source queue under the same existing owner serialization.
+    fn clear_control(&self) {
+        loop {
+            if let Some(observation) = self.control.observe() {
+                if self.control.clear(observation).is_ok() {
+                    return;
+                }
             }
+            std::thread::yield_now();
         }
     }
 
@@ -600,16 +611,25 @@ impl ScopeState {
         if self.queued_frames == 0 {
             self.queued_buffers = 0;
         }
-        self.consumed_frames = self.consumed_frames.saturating_add(consumed as u64);
+        self.add_consumed_frames(consumed);
         consumed
+    }
+
+    // Compatibility writers remain serialized by the legacy owner/permit.
+    // Production device consumption will publish directly to this same counter.
+    fn add_consumed_frames(&self, frames: usize) {
+        let _ = self
+            .consumed_frames
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(frames as u64))
+            });
     }
 
     fn clear_queued_state(&mut self) {
         self.queued_frames = 0;
         self.queued_buffers = 0;
-        if !matches!(self.start_state, StartState::BoundaryWon { .. }) {
+        if !matches!(self.control.start_state(), StartState::BoundaryWon { .. }) {
             self.last_boundary = None;
-            self.start_state = StartState::Idle;
         }
     }
 }
@@ -618,6 +638,7 @@ struct OwnerState {
     next_scope: u64,
     current: Option<ScopeState>,
     terminal_resource: Option<(PlayerScope, OwnedTerminalResource)>,
+    preparation_resource: Option<(PlayerScope, Box<dyn Send + 'static>)>,
 }
 
 enum OwnedTerminalResource {
@@ -660,6 +681,11 @@ pub struct RendererOwner {
 }
 
 impl RendererOwner {
+    /// Inner allocation layout, excluding its Arc header and scope-owned Arcs.
+    pub(crate) fn shared_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<Shared>()
+    }
+
     /// Create an owner with validated hard limits.
     pub fn new(limits: RendererQueueLimits) -> Self {
         Self {
@@ -669,6 +695,7 @@ impl RendererOwner {
                     next_scope: 0,
                     current: None,
                     terminal_resource: None,
+                    preparation_resource: None,
                 }),
                 finalized: Condvar::new(),
                 active_scope: AtomicU64::new(0),
@@ -705,6 +732,7 @@ impl RendererOwner {
         owner.next_scope = next;
         let scope = PlayerScope { id: next };
         debug_assert!(owner.terminal_resource.is_none());
+        debug_assert!(owner.preparation_resource.is_none());
         self.shared.active_scope.store(next, Ordering::Release);
         self.shared.underrun_frames.store(0, Ordering::Release);
         self.shared
@@ -792,6 +820,38 @@ impl RendererOwner {
         }
         owner.terminal_resource = Some((scope, resource));
         RendererOperationOutcome::Applied
+    }
+
+    /// Transfer the non-RT preparation worker to the existing scope finalizer.
+    /// Its Drop must stop/join the worker, and must not depend on acquiring a
+    /// source queue held by a concurrent teardown caller. Rejected new resources
+    /// are dropped after releasing the owner mutex; an installed one is retained.
+    pub(crate) fn attach_preparation_resource(
+        &self,
+        scope: PlayerScope,
+        resource: Box<dyn Send + 'static>,
+    ) -> Result<(), RendererOperationOutcome> {
+        let mut owner = self.shared.state.lock();
+        let outcome = match owner.current.as_ref() {
+            Some(state) if state.scope == scope => {
+                if !state.accepting
+                    || state.terminal_state != TerminalState::Open
+                    || owner.preparation_resource.is_some()
+                {
+                    Err(RendererOperationOutcome::Closed)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err(RendererOperationOutcome::StaleScope),
+        };
+        if outcome.is_ok() {
+            owner.preparation_resource = Some((scope, resource));
+        } else {
+            drop(owner);
+            drop(resource);
+        }
+        outcome
     }
 
     #[cfg(test)]
@@ -910,6 +970,7 @@ impl RendererOwner {
         if !state.accepting || state.terminal_state != TerminalState::Open {
             return RendererOperationOutcome::Closed;
         }
+        state.clear_control();
         clear_queue();
         state.clear_queued_state();
         RendererOperationOutcome::Applied
@@ -1059,6 +1120,7 @@ impl RendererOwner {
             .fetch_or(CALLBACK_CLOSED, Ordering::AcqRel);
     }
 
+    #[cfg(test)]
     pub(crate) fn try_callback_permit(
         &self,
         scope: PlayerScope,
@@ -1128,6 +1190,7 @@ impl RendererOwner {
         if !state.accepting || state.terminal_state != TerminalState::Open {
             return RendererOperationOutcome::Closed;
         }
+        state.clear_control();
         state.clear_queued_state();
         RendererOperationOutcome::Applied
     }
@@ -1148,17 +1211,12 @@ impl RendererOwner {
         if !state.accepting || state.terminal_state != TerminalState::Open {
             return ScheduledArmOutcome::Closed;
         }
-        match state.start_state {
-            StartState::Idle => {
-                state.start_state = StartState::Armed { start_at_zone_us };
-                ScheduledArmOutcome::Armed
+        loop {
+            if let Ok(outcome) = state.control.try_arm(start_at_zone_us) {
+                return outcome;
             }
-            StartState::Armed { start_at_zone_us } => {
-                ScheduledArmOutcome::AlreadyArmed { start_at_zone_us }
-            }
-            StartState::BoundaryWon { start_at_zone_us } => {
-                ScheduledArmOutcome::BoundaryAlreadyWon { start_at_zone_us }
-            }
+            // Only this non-RT owner retries interference with the device.
+            std::thread::yield_now();
         }
     }
 
@@ -1171,7 +1229,66 @@ impl RendererOwner {
         if state.scope != scope {
             return Err(RendererOperationOutcome::StaleScope);
         }
-        Ok(state.start_state)
+        Ok(state.control.start_state())
+    }
+
+    /// Retain the current scope's single control authority on a non-RT thread.
+    /// Scope validity remains owned here; a retained old gate never becomes the
+    /// authority of a replacement scope. Keep its Arc outside callback calls.
+    pub(crate) fn control_gate(
+        &self,
+        scope: PlayerScope,
+    ) -> Result<Arc<ControlGate>, RendererOperationOutcome> {
+        let owner = self.shared.state.lock();
+        let state = owner
+            .current
+            .as_ref()
+            .filter(|state| state.scope == scope)
+            .ok_or(RendererOperationOutcome::StaleScope)?;
+        Ok(Arc::clone(&state.control))
+    }
+
+    /// Retain the actual consumption publisher for the validated current scope.
+    /// Closed scopes remain readable; replacement scopes receive a fresh Arc.
+    /// The device reader owns steady-state writes after legacy permit migration.
+    pub(crate) fn consumption_counter(
+        &self,
+        scope: PlayerScope,
+    ) -> Result<Arc<AtomicU64>, RendererOperationOutcome> {
+        let owner = self.shared.state.lock();
+        let state = owner
+            .current
+            .as_ref()
+            .filter(|state| state.scope == scope)
+            .ok_or(RendererOperationOutcome::StaleScope)?;
+        Ok(Arc::clone(&state.consumed_frames))
+    }
+
+    /// Settle actual queue capacity on the serialized non-RT source side.
+    /// Applied never adds consumption or raises admission high-water marks.
+    /// Closed/StaleScope leave all accounting and boundary fields unchanged.
+    pub(crate) fn reconcile_queue(
+        &self,
+        scope: PlayerScope,
+        queued_frames: usize,
+        queued_buffers: usize,
+        boundary: Option<i64>,
+    ) -> RendererOperationOutcome {
+        let mut owner = self.shared.state.lock();
+        let Some(state) = owner.current.as_mut().filter(|state| state.scope == scope) else {
+            return RendererOperationOutcome::StaleScope;
+        };
+        if !state.accepting || state.terminal_state != TerminalState::Open {
+            return RendererOperationOutcome::Closed;
+        }
+        debug_assert!(queued_frames <= self.limits.hard_frames);
+        debug_assert!(queued_buffers <= self.limits.hard_buffers);
+        state.queued_frames = queued_frames;
+        state.queued_buffers = queued_buffers;
+        if let Some(boundary) = boundary {
+            state.record_trusted_boundary(boundary);
+        }
+        RendererOperationOutcome::Applied
     }
 
     /// Fence future enqueue and callback consumption for this scope.
@@ -1186,6 +1303,7 @@ impl RendererOwner {
         if !state.accepting {
             return RendererOperationOutcome::Closed;
         }
+        state.control.close();
         state.accepting = false;
         self.close_callback_telemetry();
         state.terminal = Some(RendererTerminal::Closed);
@@ -1206,6 +1324,7 @@ impl RendererOwner {
             return RendererOperationOutcome::Closed;
         }
         state.fault = Some(fault);
+        state.control.close();
         state.accepting = false;
         self.close_callback_telemetry();
         RendererOperationOutcome::Applied
@@ -1269,10 +1388,12 @@ impl RendererOwner {
             .as_ref()
             .filter(|state| state.scope == scope)
             .ok_or(RendererOperationOutcome::StaleScope)?;
-        Ok(state.consumed_frames)
+        Ok(state.consumed_frames.load(Ordering::Acquire))
     }
 
     /// Read the current scope's complete typed health snapshot.
+    /// Terminal/fault evidence is published only once in-flight consumption is
+    /// stable. Closing acceptance itself does not wait for a device callback.
     pub fn health(
         &self,
         scope: PlayerScope,
@@ -1292,18 +1413,21 @@ impl RendererOwner {
         state: &ScopeState,
         (callback_count, output_timestamps): (u64, OutputTimestampEvidenceSnapshot),
     ) -> RendererHealthSnapshot {
+        // Acquire the callback completion before sampling its final consumption.
+        // This is consumption stability, not a stream-stop or resource-release Ack.
+        let terminal_ready = !state.control.terminal_consumption_pending();
         RendererHealthSnapshot {
             scope: state.scope,
             queued_frames: state.queued_frames,
             queued_buffers: state.queued_buffers,
             limits: self.limits,
-            consumed_frames: state.consumed_frames,
+            consumed_frames: state.consumed_frames.load(Ordering::Acquire),
             callback_count,
             underrun_frames: self.shared.underrun_frames.load(Ordering::Acquire),
             output_timestamps,
-            last_presentation_boundary_zone_us: state.last_boundary,
-            fault: state.fault,
-            terminal: state.terminal,
+            last_presentation_boundary_zone_us: state.presentation_boundary(),
+            fault: state.fault.filter(|_| terminal_ready),
+            terminal: state.terminal.filter(|_| terminal_ready),
         }
     }
 
@@ -1376,6 +1500,7 @@ impl RendererOwner {
         pre_start_only: bool,
         clear_queue_on_open: bool,
         clear_armed_queue: F,
+        #[cfg(test)] test_start_claim: Option<&dyn Fn() -> Result<(), i64>>,
     ) -> FinalizeRequestOutcome
     where
         F: FnOnce(),
@@ -1391,10 +1516,22 @@ impl RendererOwner {
         match state.terminal_state {
             TerminalState::Open => {
                 if pre_start_only {
-                    if let StartState::BoundaryWon { start_at_zone_us } = state.start_state {
+                    // Production cancellation and callback boundary compete in
+                    // the same per-scope gate. A claim alone is never an Ack.
+                    #[cfg(not(test))]
+                    let won_boundary = state.control.cancel_before_start().err();
+                    // Retain the historical feasibility fixture's substitution;
+                    // ordinary tests and production use the installed authority.
+                    #[cfg(test)]
+                    let won_boundary = match test_start_claim {
+                        Some(claim) => claim().err(),
+                        None => state.control.cancel_before_start().err(),
+                    };
+                    if let Some(start_at_zone_us) = won_boundary {
                         return FinalizeRequestOutcome::BoundaryAlreadyWon { start_at_zone_us };
                     }
                 }
+                state.control.close();
                 if pre_start_only || clear_queue_on_open {
                     clear_armed_queue
                         .take()
@@ -1404,7 +1541,6 @@ impl RendererOwner {
                 }
                 if pre_start_only {
                     state.last_boundary = None;
-                    state.start_state = StartState::Idle;
                 }
                 state.accepting = false;
                 self.close_callback_telemetry();
@@ -1460,6 +1596,14 @@ impl RendererOwner {
             }
             None => None,
         };
+        let preparation_resource = match owner.preparation_resource.take() {
+            Some((resource_scope, resource)) if resource_scope == scope => Some(resource),
+            Some(other) => {
+                owner.preparation_resource = Some(other);
+                None
+            }
+            None => None,
+        };
         drop(owner);
 
         let resource_was_owned = terminal_resource.is_some();
@@ -1469,6 +1613,11 @@ impl RendererOwner {
             Some(OwnedTerminalResource::Test(resource)) => drop(resource),
             None => {}
         }
+
+        // The stream destructor stops its callback before the worker is joined.
+        // A constructor may have installed only a worker; still release it, but
+        // do not turn that into evidence that a stream/callback was owned.
+        drop(preparation_resource);
 
         let ack = TerminalAck {
             stream_released: resource_was_owned,
@@ -1498,7 +1647,15 @@ impl RendererOwner {
 
     /// Explicit teardown using the shared terminal path.
     pub fn teardown(&self, scope: PlayerScope) -> TerminalOutcome {
-        match self.finalize_request(scope, TerminalWinner::ExplicitTeardown, false, false, || {}) {
+        match self.finalize_request(
+            scope,
+            TerminalWinner::ExplicitTeardown,
+            false,
+            false,
+            || {},
+            #[cfg(test)]
+            None,
+        ) {
             FinalizeRequestOutcome::Terminal(outcome) => outcome,
             FinalizeRequestOutcome::TerminalPending => {
                 unreachable!("ordinary teardown waits for existing finalization")
@@ -1523,6 +1680,8 @@ impl RendererOwner {
             false,
             true,
             clear_queue,
+            #[cfg(test)]
+            None,
         ) {
             FinalizeRequestOutcome::Terminal(outcome) => ActualTeardownOutcome::Complete(outcome),
             FinalizeRequestOutcome::TerminalPending => ActualTeardownOutcome::FinalizationPending,
@@ -1556,6 +1715,30 @@ impl RendererOwner {
         outcome
     }
 
+    /// Test-only authority substitution; no fabricated state or terminal Ack.
+    #[cfg(test)]
+    pub(crate) fn finalize_test_pre_start_with_authority(
+        &self,
+        scope: PlayerScope,
+        claim: &dyn Fn() -> Result<(), i64>,
+        clear: impl FnOnce(),
+    ) -> Result<TerminalOutcome, i64> {
+        match self.finalize_request(
+            scope,
+            TerminalWinner::PreStartAbort,
+            true,
+            true,
+            clear,
+            Some(claim),
+        ) {
+            FinalizeRequestOutcome::Terminal(outcome) => Ok(outcome),
+            FinalizeRequestOutcome::BoundaryAlreadyWon { start_at_zone_us } => {
+                Err(start_at_zone_us)
+            }
+            FinalizeRequestOutcome::TerminalPending => unreachable!("pre-start abort waits"),
+        }
+    }
+
     /// Abort before the scheduled boundary using the shared terminal path.
     pub fn abort_before_start(&self, scope: PlayerScope) -> PreStartAbortOutcome {
         self.abort_before_start_with_actual(scope, || {})
@@ -1575,6 +1758,8 @@ impl RendererOwner {
             true,
             true,
             clear_armed_queue,
+            #[cfg(test)]
+            None,
         ) {
             FinalizeRequestOutcome::Terminal(TerminalOutcome::Won(value)) => {
                 PreStartAbortOutcome::Won(value)
@@ -1639,11 +1824,13 @@ impl Drop for TimestampTelemetryWriter<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct RendererCallbackPermit<'a> {
     owner: MutexGuard<'a, OwnerState>,
     scope: PlayerScope,
 }
 
+#[cfg(test)]
 impl RendererCallbackPermit<'_> {
     pub(crate) fn scheduled_start(
         &mut self,
@@ -1671,7 +1858,7 @@ impl RendererCallbackPermit<'_> {
             .as_mut()
             .expect("callback permit keeps current scope installed");
         debug_assert_eq!(state.scope, self.scope);
-        state.consumed_frames = state.consumed_frames.saturating_add(consumed_frames as u64);
+        state.add_consumed_frames(consumed_frames);
         if let Some(boundary) = boundary_zone_us {
             state.record_trusted_boundary(boundary);
         }
@@ -1691,6 +1878,235 @@ mod tests {
     use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn renderer_realtime_owner_reads_actual_consumption_without_reconciliation_backfill() {
+        let owner = RendererOwner::new(RendererQueueLimits::new(32, 8, 16).unwrap());
+        let scope = owner.mint_scope().unwrap();
+        assert!(matches!(
+            owner.enqueue(scope, 12),
+            super::EnqueueOutcome::Accepted { .. }
+        ));
+        let counter = owner.consumption_counter(scope).unwrap();
+        counter.store(7, Ordering::Release);
+        assert_eq!(owner.consumed_frames(scope), Ok(7));
+        assert_eq!(owner.health(scope).unwrap().consumed_frames(), 7);
+        assert_eq!(
+            owner.reconcile_queue(scope, 5, 1, Some(123)),
+            RendererOperationOutcome::Applied
+        );
+        assert_eq!(
+            owner.reconcile_queue(scope, 5, 1, None),
+            RendererOperationOutcome::Applied
+        );
+        let health = owner.health(scope).unwrap();
+        assert_eq!(health.consumed_frames(), 7);
+        assert_eq!(health.last_presentation_boundary_zone_us(), Some(123));
+        let capacity = owner.capacity(scope).unwrap();
+        assert_eq!(capacity.current_frames(), 5);
+        assert_eq!(capacity.current_buffers(), 1);
+        assert_eq!(capacity.high_water_frames(), 12);
+        assert_eq!(capacity.high_water_buffers(), 1);
+        assert_eq!(owner.clear(scope), RendererOperationOutcome::Applied);
+        assert_eq!(owner.consumed_frames(scope), Ok(7));
+    }
+
+    #[test]
+    fn renderer_realtime_owner_actual_counter_isolated_across_scope_replacement() {
+        let (owner, scope) = owner_and_scope();
+        let old = owner.consumption_counter(scope).unwrap();
+        old.store(7, Ordering::Release);
+        owner.close(scope);
+        assert_eq!(
+            owner.reconcile_queue(scope, 2, 1, Some(123)),
+            RendererOperationOutcome::Closed
+        );
+        assert_eq!(owner.health(scope).unwrap().queued_frames(), 0);
+        assert_eq!(
+            owner
+                .consumption_counter(scope)
+                .unwrap()
+                .load(Ordering::Acquire),
+            7
+        );
+        owner.teardown(scope);
+        assert_eq!(owner.consumed_frames(scope), Ok(7));
+        let replacement = owner.mint_scope().unwrap();
+        // Even an incorrectly retained old publisher cannot write the new scope.
+        old.store(99, Ordering::Release);
+        assert_eq!(owner.consumed_frames(replacement), Ok(0));
+        assert_eq!(owner.health(replacement).unwrap().consumed_frames(), 0);
+        assert!(matches!(
+            owner.consumption_counter(scope),
+            Err(RendererOperationOutcome::StaleScope)
+        ));
+        assert_eq!(
+            owner.reconcile_queue(scope, 2, 1, None),
+            RendererOperationOutcome::StaleScope
+        );
+    }
+
+    #[test]
+    fn renderer_realtime_owner_legacy_consumption_saturates_shared_counter() {
+        let (owner, scope) = owner_and_scope();
+        owner.enqueue(scope, 4);
+        let counter = owner.consumption_counter(scope).unwrap();
+        counter.store(u64::MAX - 1, Ordering::Release);
+        assert_eq!(owner.consume(scope, 2), RendererOperationOutcome::Applied);
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(
+            owner.record_callback(scope, 1, 0, None),
+            RendererOperationOutcome::Applied
+        );
+        owner
+            .try_callback_permit(scope)
+            .unwrap()
+            .record_actual_progress(1, None, 0, 0);
+        assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(owner.health(scope).unwrap().consumed_frames(), u64::MAX);
+    }
+
+    #[test]
+    fn renderer_realtime_owner_health_reads_gate_winner_without_backfill() {
+        for boundary in [i64::MIN, -1, 0, i64::MAX] {
+            let owner = RendererOwner::new(RendererQueueLimits::new(32, 8, 16).unwrap());
+            let scope = owner.mint_scope().unwrap();
+            let gate = owner.control_gate(scope).unwrap();
+            owner.record_callback(scope, 0, 0, Some(17));
+            assert_eq!(
+                owner.arm_scheduled_start(scope, boundary),
+                ScheduledArmOutcome::Armed
+            );
+            // Armed ignores new ordinary observations, retaining the prior Idle one.
+            owner.record_callback(scope, 0, 0, Some(99));
+            assert_eq!(
+                owner
+                    .health(scope)
+                    .unwrap()
+                    .last_presentation_boundary_zone_us(),
+                Some(17)
+            );
+            let callback = gate.begin_callback();
+            assert_eq!(
+                callback.decide_start(Some(boundary)),
+                ScheduledStartOutcome::BoundaryWon {
+                    start_at_zone_us: boundary
+                }
+            );
+            // Read before callback completion: no worker/permit backfill exists.
+            assert_eq!(
+                owner.start_state(scope),
+                Ok(StartState::BoundaryWon {
+                    start_at_zone_us: boundary
+                })
+            );
+            assert_eq!(
+                owner
+                    .health(scope)
+                    .unwrap()
+                    .last_presentation_boundary_zone_us(),
+                Some(boundary)
+            );
+            assert_eq!(
+                owner.abort_before_start(scope),
+                PreStartAbortOutcome::BoundaryAlreadyWon {
+                    start_at_zone_us: boundary
+                }
+            );
+            drop(callback);
+            assert_eq!(owner.clear(scope), RendererOperationOutcome::Applied);
+            assert_eq!(owner.close(scope), RendererOperationOutcome::Applied);
+            assert_eq!(
+                owner
+                    .health(scope)
+                    .unwrap()
+                    .last_presentation_boundary_zone_us(),
+                Some(boundary)
+            );
+            assert_eq!(
+                owner.start_state(scope),
+                Ok(StartState::BoundaryWon {
+                    start_at_zone_us: boundary
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_realtime_owner_close_preserves_armed_and_replaced_scope_is_stale() {
+        let owner = RendererOwner::new(RendererQueueLimits::new(32, 8, 16).unwrap());
+        let scope = owner.mint_scope().unwrap();
+        let old_gate = owner.control_gate(scope).unwrap();
+        owner.record_callback(scope, 0, 0, Some(17));
+        assert_eq!(
+            owner.arm_scheduled_start(scope, 100),
+            ScheduledArmOutcome::Armed
+        );
+        assert_eq!(owner.close(scope), RendererOperationOutcome::Applied);
+        assert_eq!(
+            owner.start_state(scope),
+            Ok(StartState::Armed {
+                start_at_zone_us: 100
+            })
+        );
+        assert_eq!(
+            owner
+                .health(scope)
+                .unwrap()
+                .last_presentation_boundary_zone_us(),
+            Some(17)
+        );
+        assert_eq!(
+            old_gate.begin_callback().decide_start(Some(100)),
+            ScheduledStartOutcome::Closed
+        );
+        owner.teardown(scope);
+        assert_eq!(
+            owner.start_state(scope),
+            Ok(StartState::Armed {
+                start_at_zone_us: 100
+            })
+        );
+        let fresh = owner.mint_scope().unwrap();
+        assert_eq!(
+            owner.start_state(scope),
+            Err(RendererOperationOutcome::StaleScope)
+        );
+        assert_eq!(
+            owner.health(scope),
+            Err(RendererOperationOutcome::StaleScope)
+        );
+        assert_eq!(
+            old_gate.begin_callback().decide_start(Some(100)),
+            ScheduledStartOutcome::Closed
+        );
+        assert_eq!(owner.start_state(fresh), Ok(StartState::Idle));
+    }
+
+    #[test]
+    fn renderer_realtime_owner_cancel_fences_inflight_gate_and_clears_phase() {
+        let owner = RendererOwner::new(RendererQueueLimits::new(32, 8, 16).unwrap());
+        let scope = owner.mint_scope().unwrap();
+        let gate = owner.control_gate(scope).unwrap();
+        owner.arm_scheduled_start(scope, i64::MAX);
+        let callback = gate.begin_callback();
+        assert!(matches!(
+            owner.abort_before_start(scope),
+            PreStartAbortOutcome::Won(_)
+        ));
+        assert_eq!(
+            callback.decide_start(Some(i64::MAX)),
+            ScheduledStartOutcome::Closed
+        );
+        assert_eq!(owner.start_state(scope), Ok(StartState::Idle));
+        assert_eq!(
+            owner
+                .health(scope)
+                .unwrap()
+                .last_presentation_boundary_zone_us(),
+            None
+        );
+    }
 
     struct DropProbe(Arc<AtomicUsize>);
 
@@ -1807,6 +2223,123 @@ mod tests {
         assert_eq!(won, observed);
         assert!(won.ack.stream_released());
         assert!(won.ack.callback_stopped());
+    }
+
+    #[test]
+    fn renderer_realtime_owner_preparation_release_precedes_ack_and_scope_replacement() {
+        // The worker Drop is a controlled join boundary. No audio device, sleeps,
+        // or second terminal state machine are needed to exercise the real owner.
+        struct WorkerJoin {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            completed: Arc<AtomicBool>,
+            stream_drops: Arc<AtomicUsize>,
+            expected_stream_drops: usize,
+        }
+        impl Drop for WorkerJoin {
+            fn drop(&mut self) {
+                assert_eq!(
+                    self.stream_drops.load(Ordering::Acquire),
+                    self.expected_stream_drops
+                );
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                self.completed.store(true, Ordering::Release);
+            }
+        }
+
+        for with_stream in [false, true] {
+            let (owner, scope) = owner_and_scope();
+            let stream_drops = Arc::new(AtomicUsize::new(0));
+            if with_stream {
+                attach_probe(&owner, scope, Arc::clone(&stream_drops));
+            }
+            let completed = Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            assert_eq!(
+                owner.attach_preparation_resource(
+                    scope,
+                    Box::new(WorkerJoin {
+                        entered: entered_tx,
+                        release: release_rx,
+                        completed: Arc::clone(&completed),
+                        stream_drops,
+                        expected_stream_drops: usize::from(with_stream),
+                    })
+                ),
+                Ok(())
+            );
+            let (ack_tx, ack_rx) = mpsc::channel();
+            let winner = {
+                let owner = owner.clone();
+                thread::spawn(move || ack_tx.send(owner.teardown(scope)).unwrap())
+            };
+            entered_rx.recv().unwrap();
+            // This is inside the blocked resource Drop, not a timing guess.
+            let phase_before_release = owner.terminal_state(scope);
+            let premature_ack = ack_rx.try_recv();
+            let (mint_entered_tx, mint_entered_rx) = mpsc::channel();
+            let reopen = {
+                let owner = owner.clone();
+                let completed = Arc::clone(&completed);
+                thread::spawn(move || {
+                    mint_entered_tx.send(()).unwrap();
+                    let new_scope = owner.mint_scope().unwrap();
+                    assert!(
+                        completed.load(Ordering::Acquire),
+                        "scope replacement must follow worker join"
+                    );
+                    new_scope
+                })
+            };
+            mint_entered_rx.recv().unwrap();
+            release_tx.send(()).unwrap();
+            winner.join().unwrap();
+            let terminal = ack_rx.recv().unwrap();
+            let new_scope = reopen.join().unwrap();
+            assert!(matches!(
+                phase_before_release,
+                Ok(super::TerminalState::Finalizing { .. })
+            ));
+            assert_eq!(premature_ack, Err(mpsc::TryRecvError::Empty));
+            let TerminalOutcome::Won(finalization) = terminal else {
+                panic!("single finalizer must win");
+            };
+            assert_eq!(finalization.ack.stream_released(), with_stream);
+            assert_eq!(finalization.ack.callback_stopped(), with_stream);
+            assert_ne!(scope, new_scope);
+        }
+    }
+
+    #[test]
+    fn renderer_realtime_owner_rejects_duplicate_worker_without_replacing_installed_resource() {
+        let (owner, scope) = owner_and_scope();
+        let installed_drops = Arc::new(AtomicUsize::new(0));
+        let rejected_drops = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            owner.attach_preparation_resource(
+                scope,
+                Box::new(DropProbe(Arc::clone(&installed_drops)))
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            owner.attach_preparation_resource(
+                scope,
+                Box::new(DropProbe(Arc::clone(&rejected_drops)))
+            ),
+            Err(RendererOperationOutcome::Closed)
+        );
+        assert_eq!(installed_drops.load(Ordering::Acquire), 0);
+        assert_eq!(rejected_drops.load(Ordering::Acquire), 1);
+        let first = owner.teardown(scope);
+        let second = owner.teardown(scope);
+        assert_eq!(installed_drops.load(Ordering::Acquire), 1);
+        assert_eq!(first.finalization(), second.finalization());
+        let ack = first.finalization().unwrap().ack;
+        assert!(!ack.stream_released());
+        assert!(!ack.callback_stopped());
     }
 
     #[test]

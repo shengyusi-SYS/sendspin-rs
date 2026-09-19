@@ -43,6 +43,8 @@ opus-rs = "=0.1.23"
 
 # Concurrency
 crossbeam = "0.8"
+# Fixed-capacity PCM handoff and non-realtime window return.
+rtrb = "=0.3.4"
 
 # Fast mutexes
 parking_lot = "0.12"
