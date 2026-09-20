@@ -510,35 +510,38 @@ impl Worker {
                                 // the worker horizon instead of refilling the ring
                                 // with a duplicate of its still-valid prefix.
                                 let append = self.snapshot.is_some_and(|(epoch, _)| epoch == key.0);
-                                let refreshed = append
-                                    && queue
-                                        .reconcile_actual(
-                                            &self.publication,
-                                            &self.owner,
-                                            self.scope,
-                                        )
-                                        .is_ok_and(|view| {
-                                            if self.prepared_base < queue.settled_consumed
-                                                || !self.publication.control.validate(&view)
-                                            {
-                                                return false;
+                                let mut rebuild = !append;
+                                if append {
+                                    if let Ok(view) = queue.reconcile_actual(
+                                        &self.publication,
+                                        &self.owner,
+                                        self.scope,
+                                    ) {
+                                        if view.epoch() == key.0
+                                            && self.publication.control.validate(&view)
+                                        {
+                                            rebuild = self.prepared_base < queue.settled_consumed;
+                                            if !rebuild {
+                                                queue.refresh_preparation_into(&mut self.private);
+                                                self.snapshot = Some(key);
                                             }
-                                            queue.refresh_preparation_into(&mut self.private);
-                                            true
-                                        });
-                                if refreshed {
-                                    self.snapshot = Some(key);
-                                } else if let Ok((epoch, revision, base)) = queue
-                                    .preparation_snapshot(
+                                        }
+                                    }
+                                    // An in-flight callback only defers this
+                                    // refresh. It must not cause a second attempt
+                                    // that rebuilds from a newer actual cursor.
+                                }
+                                if rebuild {
+                                    if let Ok((epoch, revision, base)) = queue.preparation_snapshot(
                                         &self.publication,
                                         &self.owner,
                                         self.scope,
                                         &mut self.private,
-                                    )
-                                {
-                                    self.snapshot = Some((epoch, revision));
-                                    self.prepared_base = base;
-                                    self.pending_window = false;
+                                    ) {
+                                        self.snapshot = Some((epoch, revision));
+                                        self.prepared_base = base;
+                                        self.pending_window = false;
+                                    }
                                 }
                             } else {
                                 let _ = queue.reconcile_actual(
