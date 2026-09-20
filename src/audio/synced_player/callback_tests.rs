@@ -1143,3 +1143,155 @@ fn callback_close_and_fault_publish_health_only_after_actual_consumption_stabili
         assert_eq!(stable.fault(), finished.fault());
     }
 }
+
+// T2: continuous public admission + production worker + actual data callback.
+// Separate deterministic clocks exercise append/prepare/render interleavings;
+// no native stream, real sleep or OS scheduling assumption is involved.
+#[test]
+fn callback_streaming_append_preserves_continuous_pcm() {
+    for rate in [44_100_u32, 48_000] {
+        for append_phase_ms in [0, 7] {
+            let chunk_frames = rate as usize / 50;
+            let callback_frames = rate as usize / 100;
+            let mut h = Harness::configured(
+                rate,
+                2,
+                RendererQueueLimits::new(rate as usize * 2, 128, chunk_frames).unwrap(),
+                false,
+            );
+            let enqueue = |h: &Harness, chunk: usize| {
+                let buffer = AudioBuffer {
+                    timestamp: 1_000_000 + chunk as i64 * 20_000,
+                    samples: (chunk * chunk_frames + 1..=(chunk + 1) * chunk_frames)
+                        .flat_map(|frame| [frame as i32 * 1024; 2])
+                        .collect::<Vec<_>>()
+                        .into(),
+                    format: AudioFormat {
+                        codec: Codec::Pcm,
+                        sample_rate: rate,
+                        channels: 2,
+                        bit_depth: 32,
+                        codec_header: None,
+                    },
+                };
+                let mut queue = h.queue.lock();
+                let publication = queue.publication.clone().unwrap();
+                let outcome = queue
+                    .try_enqueue_prepared(
+                        &publication,
+                        &h.owner,
+                        h.scope,
+                        (buffer, None),
+                        chunk_frames,
+                    )
+                    .unwrap_or_else(|_| panic!("serialized fixture admission must validate"));
+                assert!(matches!(outcome, EnqueueOutcome::Accepted { .. }));
+            };
+            for chunk in 0..50 {
+                enqueue(&h, chunk);
+            }
+            // Give the real startup path its initial device-latency observation.
+            h.now_us = 823_000;
+            let (startup, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+            assert!(startup.iter().all(|sample| *sample == 0.0));
+            assert_eq!(consumed, 0);
+            let mut next_chunk = 50;
+            let mut expected_frame = 1;
+            for ms in 0..2_000_u64 {
+                if ms % 20 == append_phase_ms {
+                    enqueue(&h, next_chunk);
+                    next_chunk += 1;
+                }
+                let now = h.origin + Duration::from_micros(833_000 + ms * 1_000);
+                h.worker.step(now);
+                if ms % 10 != 0 {
+                    continue;
+                }
+                let timestamp = StreamInstant::from_nanos((833_000 + ms * 1_000) * 1_000);
+                let mut output = vec![0.0; callback_frames * 2];
+                (h.callback)(
+                    &mut output,
+                    OutputStreamTimestamp {
+                        callback: timestamp,
+                        playback: timestamp + Duration::from_micros(167_000),
+                    },
+                    OutputTimestampSource::DevicePresentation,
+                    None,
+                    now,
+                );
+                for frame in output.chunks_exact(2) {
+                    let expected = [expected_frame as f32 / 2_097_152.0; 2];
+                    assert_eq!(
+                        frame, expected,
+                        "rate={rate} phase={append_phase_ms} ms={ms} frame={expected_frame}"
+                    );
+                    expected_frame += 1;
+                }
+            }
+            h.worker.step(h.origin + Duration::from_micros(2_833_000));
+            assert_eq!(h.owner.consumed_frames(h.scope), Ok(rate as u64 * 2));
+            assert_eq!(h.diagnostics.snapshot().underrun_frames, 0);
+        }
+    }
+}
+
+// A real replacement invalidates future windows, even after append refreshes.
+// Keep the original current chunk's tail, then play only the replacement PCM.
+#[test]
+fn callback_streaming_replacement_rebuilds_future_pcm() {
+    let mut h = Harness::configured(
+        1_000,
+        2,
+        RendererQueueLimits::new(2_000, 128, 200).unwrap(),
+        false,
+    );
+    let enqueue = |h: &Harness, time_ms: i64, first: i32, frames: usize| {
+        let buffer = AudioBuffer {
+            timestamp: time_ms * 1_000,
+            samples: (first..first + frames as i32)
+                .flat_map(|frame| [frame * 1024; 2])
+                .collect::<Vec<_>>()
+                .into(),
+            format: AudioFormat {
+                codec: Codec::Pcm,
+                sample_rate: 1_000,
+                channels: 2,
+                bit_depth: 32,
+                codec_header: None,
+            },
+        };
+        let mut queue = h.queue.lock();
+        let publication = queue.publication.clone().unwrap();
+        assert!(matches!(
+            queue
+                .try_enqueue_prepared(&publication, &h.owner, h.scope, (buffer, None), frames,)
+                .ok()
+                .unwrap(),
+            EnqueueOutcome::Accepted { .. }
+        ));
+    };
+    for chunk in 0..10 {
+        enqueue(&h, 1_000 + chunk * 20, chunk as i32 * 20 + 1, 20);
+    }
+    h.now_us = 823_000;
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    let mut actual = Vec::new();
+    let mut collect = |samples: Vec<f32>| {
+        actual.extend(samples.chunks_exact(2).filter_map(|frame| {
+            assert_eq!(frame[0], frame[1]);
+            (frame[0] != 0.0).then_some((frame[0] * 2_097_152.0).round() as i32)
+        }));
+    };
+    collect(h.render(OutputTimestampSource::MonotonicFallback, 0).0);
+    enqueue(&h, 1_200, 201, 20); // Refresh an unchanged preparation timeline.
+    h.worker.step(h.origin + Duration::from_micros(h.now_us));
+    // Retain current 1..20; replace every pending original chunk by 1001..1200.
+    enqueue(&h, 1_020, 1_001, 200);
+    for _ in 0..25 {
+        collect(h.render(OutputTimestampSource::MonotonicFallback, 0).0);
+    }
+    drop(collect);
+    let expected: Vec<_> = (1..=20).chain(1_001..=1_200).collect();
+    assert_eq!(actual, expected);
+    assert_eq!(h.owner.consumed_frames(h.scope), Ok(220));
+}

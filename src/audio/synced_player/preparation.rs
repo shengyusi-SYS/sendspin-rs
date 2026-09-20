@@ -92,6 +92,15 @@ impl PlaybackQueue {
         destination.enqueue_count = self.enqueue_count;
     }
 
+    /// Refresh newly appended sources while retaining this worker's prepared
+    /// horizon. Caller establishes that the timeline is unchanged and that the
+    /// canonical actual position has not advanced beyond this horizon.
+    pub(super) fn refresh_preparation_into(&self, destination: &mut Self) {
+        let prepared = destination.source_position();
+        self.copy_source_into(destination);
+        destination.reconcile_source(prepared);
+    }
+
     /// Reconcile an actual device checkpoint, without replaying consumed PCM.
     /// Invoke only after validating that it belongs to this retained source view.
     pub(super) fn reconcile_source(&mut self, position: SourcePosition) {

@@ -506,12 +506,36 @@ impl Worker {
                                 queue.next_source_id,
                             );
                             if self.snapshot != Some(key) {
-                                if let Ok((epoch, revision, base)) = queue.preparation_snapshot(
-                                    &self.publication,
-                                    &self.owner,
-                                    self.scope,
-                                    &mut self.private,
-                                ) {
+                                // Appending does not invalidate prepared PCM. Keep
+                                // the worker horizon instead of refilling the ring
+                                // with a duplicate of its still-valid prefix.
+                                let append = self.snapshot.is_some_and(|(epoch, _)| epoch == key.0);
+                                let refreshed = append
+                                    && queue
+                                        .reconcile_actual(
+                                            &self.publication,
+                                            &self.owner,
+                                            self.scope,
+                                        )
+                                        .is_ok_and(|view| {
+                                            if self.prepared_base < queue.settled_consumed
+                                                || !self.publication.control.validate(&view)
+                                            {
+                                                return false;
+                                            }
+                                            queue.refresh_preparation_into(&mut self.private);
+                                            true
+                                        });
+                                if refreshed {
+                                    self.snapshot = Some(key);
+                                } else if let Ok((epoch, revision, base)) = queue
+                                    .preparation_snapshot(
+                                        &self.publication,
+                                        &self.owner,
+                                        self.scope,
+                                        &mut self.private,
+                                    )
+                                {
                                     self.snapshot = Some((epoch, revision));
                                     self.prepared_base = base;
                                     self.pending_window = false;
