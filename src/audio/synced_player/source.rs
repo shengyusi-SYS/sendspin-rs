@@ -28,7 +28,9 @@ impl Publication {
     ) -> Result<Arc<Self>, RendererOperationOutcome> {
         Ok(Arc::new(Self {
             control: owner.control_gate(scope)?,
-            checkpoint: Arc::new(PublishedCheckpoint::new()),
+            checkpoint: Arc::new(PublishedCheckpoint::with_media_boundary(
+                owner.media_boundary_publisher(scope)?,
+            )),
             consumed: owner.consumption_counter(scope)?,
             limits,
             channels,
@@ -159,8 +161,9 @@ impl PlaybackQueue {
         Ok((view.epoch(), self.next_source_id, self.settled_consumed))
     }
 
-    /// Preserve the original first-playable selection for explicit reanchor.
-    /// A missing target leaves force_reanchor pending, without invalidating PCM.
+    /// Prefer the first playable source for explicit reanchor. If all retained
+    /// sources expired, prepare a retirement-only window at the confirmed target.
+    /// Missing timing or an empty source still leaves the request pending.
     pub(super) fn try_reanchor_prepared(
         &mut self,
         publication: &Publication,
@@ -174,10 +177,11 @@ impl PlaybackQueue {
             return Ok(None);
         };
         let target = if explicit {
-            let Some(target) = self.first_playable_cursor_at_or_after(target) else {
-                return Ok(None);
-            };
-            target
+            match self.first_playable_cursor_at_or_after(target) {
+                Some(playable) => playable,
+                None if self.current.is_some() || !self.queue.is_empty() => target,
+                None => return Ok(None),
+            }
         } else {
             target
         };
@@ -457,10 +461,6 @@ mod tests {
             source.try_reanchor_prepared(&publication, &owner, scope, || None, true),
             Ok(None)
         );
-        assert_eq!(
-            source.try_reanchor_prepared(&publication, &owner, scope, || Some(400_000), true),
-            Ok(None)
-        );
         assert!(source.force_reanchor);
         assert_eq!(publication.control.view().epoch(), epoch);
         assert_eq!(
@@ -471,5 +471,105 @@ mod tests {
         assert_eq!(source.cursor_us, 300_000);
         assert_eq!(publication.control.view().epoch(), epoch + 1);
         assert_eq!(owner.consumed_frames(scope), Ok(0));
+        assert_eq!(
+            source.try_reanchor_prepared(&publication, &owner, scope, || Some(400_000), true),
+            Ok(Some(400_000))
+        );
+        assert_eq!(
+            owner.media_boundary_us(scope),
+            Ok(None),
+            "retirement still requires Reader acceptance"
+        );
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::super::{reader::Reader, transport};
+    use super::*;
+    use crate::audio::{AudioFormat, Codec};
+
+    #[test]
+    fn media_timeline_partial_reanchor_and_expired_tail_commit_actual_source_end() {
+        for target in [3_000, 10_000] {
+            let limits = RendererQueueLimits::new(4, 3, 4).unwrap();
+            let owner = RendererOwner::new(limits);
+            let scope = owner.mint_scope().unwrap();
+            let publication = Publication::new(&owner, scope, 1, limits).unwrap();
+            let mut canonical = PlaybackQueue::new();
+            canonical.attach_publication(publication.clone());
+            canonical
+                .try_enqueue_prepared(
+                    &publication,
+                    &owner,
+                    scope,
+                    (
+                        AudioBuffer {
+                            timestamp: 0,
+                            samples: Arc::from([1, 2, 3, 4]),
+                            format: AudioFormat {
+                                codec: Codec::Pcm,
+                                sample_rate: 1_000,
+                                channels: 1,
+                                bit_depth: 24,
+                                codec_header: None,
+                            },
+                        },
+                        None,
+                    ),
+                    4,
+                )
+                .ok()
+                .unwrap();
+            let mut private = PlaybackQueue::new();
+            private.queue.reserve(3);
+            let (epoch, _, base) = canonical
+                .preparation_snapshot(&publication, &owner, scope, &mut private)
+                .unwrap();
+            let (mut producer, mut device) = transport::pipe(3, 4, 1).unwrap();
+            private.prepare_window(producer.builder_mut(), epoch, base, 1, 1_000);
+            assert!(producer.publish());
+            let mut reader = Reader::new(1);
+            let mut output = [0];
+            reader.render(
+                &mut device,
+                &publication.control.begin_callback(),
+                &publication.checkpoint,
+                &publication.consumed,
+                &mut output,
+                false,
+                None,
+            );
+            assert_eq!(output, [1]);
+            assert_eq!(owner.media_boundary_us(scope), Ok(Some(1_000)));
+            canonical
+                .try_reanchor_prepared(&publication, &owner, scope, || Some(target), false)
+                .unwrap();
+            assert_eq!(
+                owner.media_boundary_us(scope),
+                Ok(Some(1_000)),
+                "bare reanchor is not disposition"
+            );
+            let (epoch, _, base) = canonical
+                .preparation_snapshot(&publication, &owner, scope, &mut private)
+                .unwrap();
+            private.prepare_window(producer.builder_mut(), epoch, base, 1, 1_000);
+            assert!(producer.publish());
+            reader.render(
+                &mut device,
+                &publication.control.begin_callback(),
+                &publication.checkpoint,
+                &publication.consumed,
+                &mut output,
+                false,
+                None,
+            );
+            assert_eq!(output, if target == 3_000 { [4] } else { [0] });
+            assert_eq!(owner.media_boundary_us(scope), Ok(Some(4_000)));
+            assert_eq!(
+                owner.consumed_frames(scope),
+                Ok(if target == 3_000 { 2 } else { 1 })
+            );
+        }
     }
 }

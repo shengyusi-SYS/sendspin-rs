@@ -340,7 +340,7 @@ fn source_pcm(samples: &[i32]) -> AudioBuffer {
 }
 
 #[test]
-fn realtime_handoff_probe_reanchor_baseline_keeps_current_then_skips_stale_pending() {
+fn realtime_handoff_probe_reanchor_baseline_skips_expired_current_and_pending() {
     let mut queue = PlaybackQueue::new();
     queue.push(source_pcm(&[1, 2, 3, 4]));
     let mut middle = source_pcm(&[10, 11, 12, 13]);
@@ -359,6 +359,6 @@ fn realtime_handoff_probe_reanchor_baseline_keeps_current_then_skips_stale_pendi
     while queue.consume_next_frame(1, 1_000, Some(&mut sample)) {
         output.push(sample[0]);
     }
-    assert_eq!(output, [2, 3, 4, 23]);
+    assert_eq!(output, [20, 21, 22, 23]);
     assert_eq!(queue.queued_frames(1), 0);
 }

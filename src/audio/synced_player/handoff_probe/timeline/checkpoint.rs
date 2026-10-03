@@ -299,7 +299,7 @@ fn realtime_handoff_probe_checkpoint_reanchor_reconciles_skipped_sources() {
     assert_eq!(retained.cursor.index, 1);
     assert_eq!(producer.reclaim(), 1);
 
-    // Same cursor-only operation as the production reanchor; current survives.
+    // Reanchoring aligns the retained current source before preparing PCM.
     preparation.cursor.cursor_us = 20_000;
     preparation.cursor.cursor_remainder = 0;
     assert!(producer
@@ -307,18 +307,18 @@ fn realtime_handoff_probe_checkpoint_reanchor_reconciles_skipped_sources() {
         .is_ok());
     let mut prefix = [0; 2];
     assert_eq!(device.render_span(&mut prefix, 1), 0);
-    assert_eq!(prefix, [2, 3]);
+    assert_eq!(prefix, [20, 21]);
     let actual = publication.read(&device.gate, &device.progress).unwrap();
     assert_eq!(actual.source_frames, 3);
     retained.reconcile_position(actual.position);
-    assert_eq!(retained.current(), 1);
-    assert_eq!(retained.cursor.index, 3);
+    assert_eq!(retained.current(), 3);
+    assert_eq!(retained.cursor.index, 2);
     assert_eq!(retained.cursor.cursor_us, 22_000);
     drop(actual);
 
     let mut suffix = [0; 2];
     assert_eq!(device.render_span(&mut suffix, 1), 0);
-    assert_eq!(suffix, [4, 23]);
+    assert_eq!(suffix, [22, 23]);
     let actual = publication.read(&device.gate, &device.progress).unwrap();
     assert_eq!(actual.source_frames, 5);
     assert_eq!(actual.position.retired_through, 3);
@@ -371,20 +371,20 @@ fn realtime_handoff_probe_checkpoint_reanchor_releases_actual_admission_capacity
         .is_ok());
     let mut prefix = [0; 2];
     assert_eq!(device.render_span(&mut prefix, 1), 0);
-    assert_eq!(prefix, [2, 3]);
+    assert_eq!(prefix, [20, 21]);
     // Append while an already prepared window still has a valid suffix.
     assert_eq!(
         ledger
             .try_enqueue(source_at(24_000, &[100; 16]), &device.gate, || {})
             .ok(),
         Some(EnqueueOutcome::Accepted {
-            queued_frames: 25,
-            queued_buffers: 4
+            queued_frames: 18,
+            queued_buffers: 2
         })
     );
     let mut suffix = [0; 2];
     assert_eq!(device.render_span(&mut suffix, 1), 0);
-    assert_eq!(suffix, [4, 23]);
+    assert_eq!(suffix, [22, 23]);
     assert_eq!(producer.reclaim(), 1);
     // The skipped blocks must release capacity even though consumption is only 5.
     assert_eq!(

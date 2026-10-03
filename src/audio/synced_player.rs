@@ -305,6 +305,31 @@ fn default_buffer_size(sample_rate: u32) -> cpal::BufferSize {
     }
 }
 
+fn output_callback_capacity(
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    ranges: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
+) -> Option<usize> {
+    let mut maximum = match config.buffer_size {
+        cpal::BufferSize::Fixed(frames) => Some(frames as usize),
+        cpal::BufferSize::Default => None,
+    };
+    for range in ranges.filter(|range| {
+        range.channels() == config.channels
+            && range.sample_format() == sample_format
+            && range.min_sample_rate() <= config.sample_rate
+            && config.sample_rate <= range.max_sample_rate()
+    }) {
+        match range.buffer_size() {
+            cpal::SupportedBufferSize::Range { max, .. } => {
+                maximum = Some(maximum.unwrap_or(0).max(*max as usize));
+            }
+            cpal::SupportedBufferSize::Unknown => return None,
+        }
+    }
+    maximum
+}
+
 /// Opaque owner token retained for exactly as long as an enqueued buffer.
 pub trait AudioBufferLifetime: Send + Sync {}
 
@@ -356,6 +381,8 @@ struct PlaybackQueue {
     /// audio content has been consumed.
     cursor_us: i64,
     cursor_remainder: i64,
+    frame_start_us: i64,
+    media_end_us: Option<i64>,
     initialized: bool,
     generation: u64,
     force_reanchor: bool,
@@ -386,6 +413,8 @@ impl PlaybackQueue {
             index: 0,
             cursor_us: 0,
             cursor_remainder: 0,
+            frame_start_us: 0,
+            media_end_us: None,
             initialized: false,
             generation: 0,
             force_reanchor: true,
@@ -535,83 +564,39 @@ impl PlaybackQueue {
         sample_rate: u32,
         destination: Option<&mut [i32]>,
     ) -> bool {
-        let needs_buffer = match self.current {
-            None => true,
-            Some(ref c) => self.index + channels > c.samples.len(),
-        };
-        if needs_buffer {
-            // Drop stale buffers that are entirely before the cursor.
-            if self.initialized {
-                while let Some(front) = self.queue.front() {
-                    if buffer_end_zone_us(front) < i128::from(self.cursor_us) {
-                        self.retired_through =
-                            self.pop_pending().expect("checked pending").source_id;
-                        continue;
-                    }
-                    break;
-                }
-            }
-
-            // Pop buffers until we find one with remaining samples past the
-            // cursor, or the queue is empty.
-            loop {
-                if let Some(previous) = self.current.take() {
-                    self.retired_through = previous.source_id;
-                }
+        // Preparation aligns the retained current chunk as well as newly popped
+        // chunks. This does not publish disposition; the Reader accepts it later.
+        loop {
+            if self.current.is_none() {
                 self.current = self.pop_pending();
                 self.index = 0;
-
-                // Skip past samples that are behind the cursor. This handles
-                // buffers that partially overlap with the current playback
-                // position, e.g. from backward timestamp jumps during server
-                // timeline rebases. Without this, playing from the start of
-                // such a buffer repeats audio the cursor has already passed,
-                // causing an audible stutter.
-                if self.initialized {
-                    if let Some(ref current) = self.current {
-                        if current.timestamp < self.cursor_us {
-                            let skip_us = self.cursor_us - current.timestamp;
-                            let skip_frames =
-                                (skip_us.saturating_mul(sample_rate as i64) / 1_000_000) as usize;
-                            if skip_frames > 0 {
-                                self.index = skip_frames
-                                    .saturating_mul(channels)
-                                    .min(current.samples.len());
-                            }
-                        }
-                    }
-                }
-
-                // If the skip consumed the entire buffer (or left fewer
-                // samples than one frame), discard it and try the next one.
-                match self.current {
-                    Some(ref c) if self.index + channels > c.samples.len() => {
-                        self.retired_through = c.source_id;
-                        self.current = None;
-                        if self.queue.is_empty() {
-                            break;
-                        }
-                        continue;
-                    }
-                    _ => break,
-                }
             }
-        }
-
-        if !self.initialized {
-            if let Some(current) = self.current.as_ref() {
-                self.cursor_us = current.timestamp;
-                self.cursor_remainder = 0;
+            let Some(current) = self.current.as_ref() else {
+                return false;
+            };
+            if self.initialized && current.timestamp < self.cursor_us {
+                let skip = (i128::from(self.cursor_us) - i128::from(current.timestamp))
+                    * i128::from(sample_rate)
+                    / 1_000_000;
+                self.index = self.index.max(
+                    usize::try_from(skip)
+                        .unwrap_or(usize::MAX)
+                        .saturating_mul(channels)
+                        .min(current.samples.len()),
+                );
+            }
+            if self.index + channels <= current.samples.len() {
                 self.initialized = true;
+                break;
             }
-        }
-
-        // Bail before advancing cursor/index when the queue is empty.
-        // Without this the cursor races ahead during underruns, causing
-        // the stale-buffer-dropping logic to discard valid buffers when
-        // audio resumes.
-        if self.current.is_none() {
-            return false;
+            let end = current.timestamp.saturating_add(
+                ((current.samples.len() / channels) as i128 * 1_000_000 / i128::from(sample_rate))
+                    as i64,
+            );
+            self.media_end_us = Some(self.media_end_us.map_or(end, |old| old.max(end)));
+            self.retired_through = current.source_id;
+            self.current = None;
+            self.index = 0;
         }
 
         let start = self.index;
@@ -621,8 +606,19 @@ impl PlaybackQueue {
                 &self.current.as_ref().expect("checked current").samples[start..end],
             );
         }
+        let source = self.current.as_ref().expect("checked current");
+        let timestamp = source.timestamp;
+        self.frame_start_us = timestamp.saturating_add(
+            ((start / channels) as i128 * 1_000_000 / i128::from(sample_rate)) as i64,
+        );
+        let elapsed = (end / channels) as i128 * 1_000_000;
+        self.cursor_us = timestamp.saturating_add((elapsed / i128::from(sample_rate)) as i64);
+        self.cursor_remainder = (elapsed % i128::from(sample_rate)) as i64;
+        self.media_end_us = Some(
+            self.media_end_us
+                .map_or(self.cursor_us, |end| end.max(self.cursor_us)),
+        );
         self.index = end;
-        self.advance_cursor(sample_rate);
         if self
             .current
             .as_ref()
@@ -640,13 +636,6 @@ impl PlaybackQueue {
         let mut frame = vec![0; channels];
         self.consume_next_frame(channels, sample_rate, Some(&mut frame))
             .then_some(frame)
-    }
-
-    fn advance_cursor(&mut self, sample_rate: u32) {
-        self.cursor_remainder += 1_000_000;
-        let advance = self.cursor_remainder / sample_rate as i64;
-        self.cursor_remainder %= sample_rate as i64;
-        self.cursor_us += advance;
     }
 
     fn first_playable_cursor_at_or_after(&self, server_time_us: i64) -> Option<i64> {
@@ -718,6 +707,9 @@ fn classify_output_timestamp(
 
 /// Bundles gain and post-processing parameters for the data callback.
 struct CallbackConfig {
+    // Internal allocation input, never a request to change the device period.
+    // None reserves against the existing admitted-source bound.
+    max_callback_frames: Option<usize>,
     gain_control: GainControl,
     process_callback: Option<ProcessCallback>,
     static_delay_us: Arc<AtomicU64>,
@@ -1011,6 +1003,7 @@ impl SyncedPlayer {
         };
 
         let cb_config = CallbackConfig {
+            max_callback_frames: None,
             gain_control: gain.clone(),
             process_callback,
             static_delay_us: Arc::clone(&static_delay_us),
@@ -1232,6 +1225,10 @@ impl SyncedPlayer {
     }
 
     /// Read committed consumption without waiting for timestamp telemetry.
+    pub fn media_boundary_us(&self) -> Result<Option<i64>, RendererOperationOutcome> {
+        self.renderer.media_boundary_us(self.scope)
+    }
+
     pub fn consumed_frames(&self) -> Result<u64, RendererOperationOutcome> {
         self.renderer.consumed_frames(self.scope)
     }
@@ -1357,7 +1354,7 @@ impl SyncedPlayer {
         queue: Arc<Mutex<PlaybackQueue>>,
         clock_sync: Arc<Mutex<ClockSync>>,
         format: AudioFormat,
-        cb_config: CallbackConfig,
+        mut cb_config: CallbackConfig,
         outputs: CallbackOutputs,
         diagnostics: SyncDiagnosticsReader,
     ) -> Result<Stream, Error> {
@@ -1374,6 +1371,13 @@ impl SyncedPlayer {
         stream_config.channels = config.channels;
         let mono_to_stereo = format.channels == 1 && config.channels == 2;
         stream_config.sample_rate = format.sample_rate;
+        cb_config.max_callback_frames = output_callback_capacity(
+            &stream_config,
+            device_config.sample_format(),
+            device
+                .supported_output_configs()
+                .map_err(|e| Error::Output(e.to_string()))?,
+        );
 
         macro_rules! output_stream {
             ($sample:ty) => {{
@@ -1392,40 +1396,37 @@ impl SyncedPlayer {
                 renderer_for_preparation
                     .attach_preparation_resource(scope, Box::new(resource))
                     .map_err(|_| Error::Output("renderer rejected preparation ownership".into()))?;
-                let result = device
-                    .build_output_stream(
-                        stream_config,
-                        move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
-                            render_output_channels(data, mono_to_stereo, |input| {
-                                callback(
-                                    input,
-                                    info.timestamp(),
-                                    info.timestamp_source(),
-                                    info.timestamp_diagnostics(),
-                                    Instant::now(),
-                                );
-                            });
-                        },
-                        move |err| {
-                            // cpal reports a refused real-time promotion as
-                            // RealtimeDenied ("Audio will still play"); playback
-                            // continues at normal priority. Warn without storing:
-                            // take_error()/has_error() signal fatal stream
-                            // failures, and a consumer must not tear down a
-                            // working stream over a scheduling downgrade.
-                            if err.kind() == cpal::ErrorKind::RealtimeDenied {
-                                log::warn!(
-                                    "Audio thread priority promotion failed (non-fatal): {err}"
-                                );
-                                return;
-                            }
-                            log::error!("Audio stream error: {err}");
-                            *error.lock() = Some(err.to_string());
-                            let _ = renderer_for_error.fault(scope, RendererFault::CallbackFailed);
-                        },
-                        None,
-                    )
-                    .map_err(|e| Error::Output(e.to_string()));
+                let result = build_prepared_output_stream(
+                    device,
+                    stream_config,
+                    move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
+                        render_output_channels(data, mono_to_stereo, |input| {
+                            callback(
+                                input,
+                                info.timestamp(),
+                                info.timestamp_source(),
+                                info.timestamp_diagnostics(),
+                                Instant::now(),
+                            );
+                        });
+                    },
+                    move |err| {
+                        // cpal reports a refused real-time promotion as
+                        // RealtimeDenied ("Audio will still play"); playback
+                        // continues at normal priority. Warn without storing:
+                        // take_error()/has_error() signal fatal stream
+                        // failures, and a consumer must not tear down a
+                        // working stream over a scheduling downgrade.
+                        if err.kind() == cpal::ErrorKind::RealtimeDenied {
+                            log::warn!("Audio thread priority promotion failed (non-fatal): {err}");
+                            return;
+                        }
+                        log::error!("Audio stream error: {err}");
+                        *error.lock() = Some(err.to_string());
+                        let _ = renderer_for_error.fault(scope, RendererFault::CallbackFailed);
+                    },
+                )
+                .map_err(|e| Error::Output(e.to_string()));
                 if result.is_err() {
                     let _ = renderer_for_preparation.teardown(scope);
                 }
@@ -1459,6 +1460,41 @@ impl SyncedPlayer {
             ))),
         }
     }
+}
+
+/// PulseAudio's server-managed default may prefill seconds in one request.
+/// Bound this player's server queue without asking PulseAudio to adjust the
+/// sink hardware latency (Fixed's behavior, which under-serves some WSLg sinks).
+/// Other hosts and callers' explicit Fixed settings retain their normal path.
+fn build_prepared_output_stream<T, D, E>(
+    device: &Device,
+    config: StreamConfig,
+    data_callback: D,
+    error_callback: E,
+) -> Result<Stream, cpal::Error>
+where
+    T: cpal::SizedSample,
+    D: FnMut(&mut [T], &cpal::OutputCallbackInfo) + Send + 'static,
+    E: FnMut(cpal::Error) + Send + 'static,
+{
+    #[cfg(target_os = "linux")]
+    if config.buffer_size == cpal::BufferSize::Default {
+        if let cpal::platform::DeviceInner::PulseAudio(pulse) = device.as_inner() {
+            // 20ms minreq / 40ms target fits the ordinary 60ms ready horizon,
+            // including a two-period prefill. This is a server queue budget,
+            // not a guarantee about arbitrary host scheduling or bursts.
+            return pulse
+                .build_output_stream_with_buffer_budget(
+                    config,
+                    (config.sample_rate / 50).max(1),
+                    data_callback,
+                    error_callback,
+                    None,
+                )
+                .map(Stream::from);
+        }
+    }
+    device.build_output_stream(config, data_callback, error_callback, None)
 }
 
 /// Canonical data callback, constructed independently of opening the native stream.
@@ -1543,6 +1579,49 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{mpsc, Arc};
     use std::thread;
+
+    #[test]
+    fn output_callback_capacity_matches_actual_stream_and_unknown_bound() {
+        use cpal::{BufferSize, SampleFormat, StreamConfig, SupportedBufferSize as Buffer};
+        let range = |channels, format, min_rate, max_rate, buffer| {
+            cpal::SupportedStreamConfigRange::new(channels, min_rate, max_rate, buffer, format)
+        };
+        let config = StreamConfig {
+            channels: 2,
+            sample_rate: 44_100,
+            buffer_size: BufferSize::Fixed(512),
+        };
+        let known = Buffer::Range { min: 32, max: 2048 };
+        let ranges = [
+            range(1, SampleFormat::F32, 44_100, 48_000, Buffer::Unknown),
+            range(2, SampleFormat::I16, 44_100, 48_000, Buffer::Unknown),
+            range(2, SampleFormat::F32, 48_000, 96_000, Buffer::Unknown),
+            range(2, SampleFormat::F32, 44_100, 48_000, known),
+            range(
+                2,
+                SampleFormat::F32,
+                44_100,
+                44_100,
+                Buffer::Range { min: 32, max: 4096 },
+            ),
+        ];
+        assert_eq!(
+            super::output_callback_capacity(&config, SampleFormat::F32, ranges.into_iter()),
+            Some(4096)
+        );
+        assert_eq!(
+            super::output_callback_capacity(
+                &config,
+                SampleFormat::F32,
+                [
+                    range(2, SampleFormat::F32, 44_100, 48_000, known),
+                    range(2, SampleFormat::F32, 44_100, 48_000, Buffer::Unknown)
+                ]
+                .into_iter(),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn mono_output_prefers_native_and_falls_back_only_to_stereo() {
@@ -3580,3 +3659,7 @@ mod callback_tests;
 #[cfg(test)]
 #[path = "synced_player/handoff_probe.rs"]
 mod handoff_probe;
+
+/// Device-free verification support; never enabled by production defaults.
+#[cfg(feature = "test-support")]
+pub mod test_support;

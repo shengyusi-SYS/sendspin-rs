@@ -80,6 +80,24 @@ impl Harness {
         prefill: bool,
         process_callback: Option<ProcessCallback>,
     ) -> Self {
+        Self::configured_with_capacity(
+            sample_rate,
+            channels,
+            limits,
+            prefill,
+            process_callback,
+            Some(sample_rate as usize / 100),
+        )
+    }
+
+    fn configured_with_capacity(
+        sample_rate: u32,
+        channels: u8,
+        limits: RendererQueueLimits,
+        prefill: bool,
+        process_callback: Option<ProcessCallback>,
+        max_callback_frames: Option<usize>,
+    ) -> Self {
         let origin = Instant::now(); // Arbitrary epoch; every later instant is injected.
         let clock = Arc::new(Mutex::new(ClockSync::new_same_clock(Arc::new(
             CallbackClock(origin),
@@ -125,6 +143,7 @@ impl Harness {
             clock,
             format,
             CallbackConfig {
+                max_callback_frames,
                 gain_control: GainControl::new(100, false),
                 process_callback,
                 static_delay_us: static_delay_us.clone(),
@@ -250,6 +269,98 @@ impl Harness {
         assert_eq!(self.diagnostics.snapshot().inserted_frames, 0);
         assert_eq!(self.diagnostics.snapshot().dropped_frames, 0);
     }
+}
+
+#[test]
+fn callback_capacity_512_frames_keeps_continuous_pcm() {
+    assert_callback_capacity(&[512], Some(512));
+}
+
+#[test]
+fn callback_capacity_2048_frames_keeps_continuous_pcm() {
+    assert_callback_capacity(&[2048], Some(2048));
+}
+
+#[test]
+fn callback_capacity_period_changes_keep_continuous_pcm() {
+    assert_callback_capacity(&[512, 2048, 4096, 512], Some(4096));
+}
+
+#[test]
+fn callback_capacity_unknown_backend_uses_source_horizon() {
+    assert_callback_capacity(&[8192], None);
+}
+
+fn capacity_harness(max_callback_frames: Option<usize>) -> Harness {
+    Harness::configured_with_capacity(
+        44_100,
+        2,
+        RendererQueueLimits::new(529_200, 4, 529_200).unwrap(),
+        true,
+        None,
+        max_callback_frames,
+    )
+}
+
+// T2: exercise actual preparation, partial-window ownership and callback reads.
+// An arithmetic capacity test cannot detect entry-budget or retirement errors.
+fn assert_callback_capacity(requests: &[usize], capacity: Option<usize>) {
+    let mut h = capacity_harness(capacity);
+    h.warm(OutputTimestampSource::DevicePresentation);
+    let start_us = h.now_us;
+    let mut total = 0;
+    for period in 0..48 {
+        let frames = requests[period % requests.len()];
+        h.frames = frames;
+        h.now_us = start_us + total as u64 * 1_000_000 / 44_100;
+        let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        assert_eq!(
+            consumed, frames as u64,
+            "callback {period}, {frames} frames"
+        );
+        for (offset, stereo) in data.chunks_exact(2).enumerate() {
+            let expected = (88_201 + total + offset) as f32 / 2_097_152.0;
+            assert_eq!(
+                stereo,
+                [expected, expected],
+                "callback {period}, frame {offset}"
+            );
+        }
+        assert_eq!(h.owner.health(h.scope).unwrap().underrun_frames(), 0);
+        total += frames;
+    }
+}
+
+#[test]
+fn callback_capacity_late_prefix_and_large_output_share_one_budget() {
+    let mut h = capacity_harness(Some(2048));
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    h.frames = 2048;
+    h.now_us = 873_000; // 40 ms late: discard 1764 source frames first.
+    let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    assert_eq!(consumed, 3812);
+    for (offset, stereo) in data.chunks_exact(2).enumerate() {
+        let expected = (1765 + offset) as f32 / 2_097_152.0;
+        assert_eq!(stereo, [expected, expected]);
+    }
+    assert_eq!(h.owner.health(h.scope).unwrap().underrun_frames(), 0);
+}
+
+#[test]
+fn callback_capacity_active_drop_correction_has_extra_source_frames() {
+    let mut h = capacity_harness(Some(2048));
+    h.warm(OutputTimestampSource::DevicePresentation);
+    h.frames = 2048;
+    let start_us = h.now_us;
+    // Preserve the canonical observation-count engagement gate before asserting
+    // actual correction; ninety large periods are not enough to engage it.
+    for period in 0..200 {
+        h.now_us = start_us + period * 2048 * 1_000_000 / 44_100;
+        let (data, _) = h.render(OutputTimestampSource::DevicePresentation, 267_000);
+        assert!(data.iter().all(|sample| *sample > 0.0));
+        assert_eq!(h.owner.health(h.scope).unwrap().underrun_frames(), 0);
+    }
+    assert!(h.diagnostics.snapshot().dropped_frames > 0);
 }
 
 #[test]
@@ -516,8 +627,10 @@ fn callback_actual_speed_stays_within_half_percent_over_150ms() {
                     if window.len() == window_frames + 1 {
                         let progress = frame_id - window.front().unwrap();
                         let change = (progress - window_frames as i64).unsigned_abs();
-                        assert!(change * 200 <= window_frames as u64,
-                            "speed exceeds ±0.5% at {rate} Hz: {change} changed frames / {window_frames}");
+                        assert!(
+                            change * 200 <= window_frames as u64,
+                            "speed exceeds ±0.5% at {rate} Hz: {change} changed frames / {window_frames}"
+                        );
                     }
                 }
             }
@@ -641,6 +754,7 @@ fn callback_fixed_scratch_hook_processes_every_sample_after_gain() {
     let hook_playing = Arc::clone(&playing);
     let hook_observed = Arc::clone(&observed);
     let config = CallbackConfig {
+        max_callback_frames: Some(10),
         gain_control: gain,
         static_delay_us: Arc::new(AtomicU64::new(0)),
         process_callback: Some(Box::new(move |samples| {
@@ -706,7 +820,7 @@ fn callback_repeated_delay_updates_keep_pending_pcm_and_observation_paired() {
     let now = h.origin + Duration::from_micros(h.now_us);
     // No device consumption between setters: even with all credits initially
     // free this exhausts the fixed handoff allowance without adding windows.
-    for delay in 1..=runtime::WINDOWS + 1 {
+    for delay in 1..=5 {
         set_device_delay_state(
             &h.queue,
             &h.static_delay_us,
@@ -718,7 +832,7 @@ fn callback_repeated_delay_updates_keep_pending_pcm_and_observation_paired() {
         }
     }
     let first_anchor = h.now_us as i64 + 167_000 + 1_000;
-    let latest_delay = (runtime::WINDOWS as i64 + 1) * 1_000;
+    let latest_delay = 5_000;
     let latest_target = h.now_us as i64 + 167_000 + latest_delay;
     assert!(h.queue.lock().force_reanchor);
     let before = h.owner.consumed_frames(h.scope).unwrap();
@@ -747,7 +861,10 @@ fn callback_repeated_delay_updates_keep_pending_pcm_and_observation_paired() {
     assert!(audio.iter().all(|sample| *sample > 0.0));
     assert!(consumed > 0);
     let expected_error = callback_us as i64 + 167_000 + latest_delay - latest_anchor;
-    assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(expected_error));
+    // The first callback on the new anchor now consumes its late prefix before
+    // emitting PCM, so this handoff no longer leaves a 4ms correction tail.
+    assert_eq!(consumed, 10 + expected_error as u64 / 1_000);
+    assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
 }
 
 #[test]
@@ -805,6 +922,7 @@ fn renderer_realtime_worker_join_finishes_before_terminal_ack() {
     };
     let diagnostics = SyncDiagnosticsReader::new(Arc::clone(&clock));
     let config = CallbackConfig {
+        max_callback_frames: Some(10),
         gain_control: GainControl::new(100, false),
         process_callback: None,
         static_delay_us: Arc::new(AtomicU64::new(0)),
@@ -1037,7 +1155,7 @@ fn callback_inflight_consumption_remains_final_while_owner_joins_resource() {
 // not merely one Reader scratch block. The process hook pauses after the first
 // 20 of 45 frames while ACTIVE still covers two remaining scratch blocks.
 #[test]
-fn callback_close_and_fault_publish_health_only_after_actual_consumption_stabilizes() {
+fn media_timeline_close_and_fault_freeze_boundary_after_inflight_callback() {
     use crate::audio::player_contract::RendererTerminal;
     use std::sync::{atomic::AtomicBool, mpsc};
     use std::thread;
@@ -1105,6 +1223,7 @@ fn callback_close_and_fault_publish_health_only_after_actual_consumption_stabili
         assert_eq!(output, expected);
         let finished = h.owner.health(h.scope).unwrap();
         assert_eq!(finished.consumed_frames(), 45);
+        assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_045_000)));
         assert_eq!(h.owner.consumed_frames(h.scope), Ok(45));
         if fault {
             assert_eq!(finished.fault(), Some(RendererFault::CallbackFailed));
@@ -1139,6 +1258,7 @@ fn callback_close_and_fault_publish_health_only_after_actual_consumption_stabili
         assert_eq!(h.owner.consumed_frames(h.scope), Ok(45));
         let stable = h.owner.health(h.scope).unwrap();
         assert_eq!(stable.consumed_frames(), 45);
+        assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_045_000)));
         assert_eq!(stable.terminal(), finished.terminal());
         assert_eq!(stable.fault(), finished.fault());
     }
@@ -1147,90 +1267,102 @@ fn callback_close_and_fault_publish_health_only_after_actual_consumption_stabili
 // T2: continuous public admission + production worker + actual data callback.
 // Separate deterministic clocks exercise append/prepare/render interleavings;
 // no native stream, real sleep or OS scheduling assumption is involved.
+// A one-second source lead is replenished every 20ms. Exercise a 40ms prefill
+// and a split 10+30ms burst without an intervening preparation turn, as well
+// as ordinary 10ms service. This does not model arbitrary Pulse negotiation.
 #[test]
 fn callback_streaming_append_preserves_continuous_pcm() {
     for rate in [44_100_u32, 48_000] {
         for append_phase_ms in [0, 7] {
-            let chunk_frames = rate as usize / 50;
-            let callback_frames = rate as usize / 100;
-            let mut h = Harness::configured(
-                rate,
-                2,
-                RendererQueueLimits::new(rate as usize * 2, 128, chunk_frames).unwrap(),
-                false,
-            );
-            let enqueue = |h: &Harness, chunk: usize| {
-                let buffer = AudioBuffer {
-                    timestamp: 1_000_000 + chunk as i64 * 20_000,
-                    samples: (chunk * chunk_frames + 1..=(chunk + 1) * chunk_frames)
-                        .flat_map(|frame| [frame as i32 * 1024; 2])
-                        .collect::<Vec<_>>()
-                        .into(),
-                    format: AudioFormat {
-                        codec: Codec::Pcm,
-                        sample_rate: rate,
-                        channels: 2,
-                        bit_depth: 32,
-                        codec_header: None,
-                    },
-                };
-                let mut queue = h.queue.lock();
-                let publication = queue.publication.clone().unwrap();
-                let outcome = queue
-                    .try_enqueue_prepared(
-                        &publication,
-                        &h.owner,
-                        h.scope,
-                        (buffer, None),
-                        chunk_frames,
-                    )
-                    .unwrap_or_else(|_| panic!("serialized fixture admission must validate"));
-                assert!(matches!(outcome, EnqueueOutcome::Accepted { .. }));
-            };
-            for chunk in 0..50 {
-                enqueue(&h, chunk);
-            }
-            // Give the real startup path its initial device-latency observation.
-            h.now_us = 823_000;
-            let (startup, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
-            assert!(startup.iter().all(|sample| *sample == 0.0));
-            assert_eq!(consumed, 0);
-            let mut next_chunk = 50;
-            let mut expected_frame = 1;
-            for ms in 0..2_000_u64 {
-                if ms % 20 == append_phase_ms {
-                    enqueue(&h, next_chunk);
-                    next_chunk += 1;
-                }
-                let now = h.origin + Duration::from_micros(833_000 + ms * 1_000);
-                h.worker.step(now);
-                if ms % 10 != 0 {
-                    continue;
-                }
-                let timestamp = StreamInstant::from_nanos((833_000 + ms * 1_000) * 1_000);
-                let mut output = vec![0.0; callback_frames * 2];
-                (h.callback)(
-                    &mut output,
-                    OutputStreamTimestamp {
-                        callback: timestamp,
-                        playback: timestamp + Duration::from_micros(167_000),
-                    },
-                    OutputTimestampSource::DevicePresentation,
-                    None,
-                    now,
+            for requests_ms in [&[10_u64][..], &[40][..], &[10, 30][..]] {
+                let chunk_frames = rate as usize / 50;
+                let request_period_ms: u64 = requests_ms.iter().sum();
+                let mut h = Harness::configured(
+                    rate,
+                    2,
+                    RendererQueueLimits::new(rate as usize * 2, 128, chunk_frames).unwrap(),
+                    false,
                 );
-                for frame in output.chunks_exact(2) {
-                    let expected = [expected_frame as f32 / 2_097_152.0; 2];
-                    assert_eq!(
-                        frame, expected,
-                        "rate={rate} phase={append_phase_ms} ms={ms} frame={expected_frame}"
-                    );
-                    expected_frame += 1;
+                let enqueue = |h: &Harness, chunk: usize| {
+                    let buffer = AudioBuffer {
+                        timestamp: 1_000_000 + chunk as i64 * 20_000,
+                        samples: (chunk * chunk_frames + 1..=(chunk + 1) * chunk_frames)
+                            .flat_map(|frame| [frame as i32 * 1024; 2])
+                            .collect::<Vec<_>>()
+                            .into(),
+                        format: AudioFormat {
+                            codec: Codec::Pcm,
+                            sample_rate: rate,
+                            channels: 2,
+                            bit_depth: 32,
+                            codec_header: None,
+                        },
+                    };
+                    let mut queue = h.queue.lock();
+                    let publication = queue.publication.clone().unwrap();
+                    let outcome = queue
+                        .try_enqueue_prepared(
+                            &publication,
+                            &h.owner,
+                            h.scope,
+                            (buffer, None),
+                            chunk_frames,
+                        )
+                        .unwrap_or_else(|_| panic!("serialized fixture admission must validate"));
+                    assert!(matches!(outcome, EnqueueOutcome::Accepted { .. }));
+                };
+                for chunk in 0..50 {
+                    enqueue(&h, chunk);
                 }
+                // Give the real startup path its initial device-latency observation.
+                h.now_us = 823_000;
+                let (startup, consumed) =
+                    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+                assert!(startup.iter().all(|sample| *sample == 0.0));
+                assert_eq!(consumed, 0);
+                let mut next_chunk = 50;
+                let mut expected_frame = 1;
+                for ms in 0..2_000_u64 {
+                    if ms % 20 == append_phase_ms {
+                        enqueue(&h, next_chunk);
+                        next_chunk += 1;
+                    }
+                    let now = h.origin + Duration::from_micros(833_000 + ms * 1_000);
+                    h.worker.step(now);
+                    if ms % request_period_ms != 0 {
+                        continue;
+                    }
+                    let mut presentation_offset_us = 0;
+                    for &request_ms in requests_ms {
+                        let callback_frames = rate as usize * request_ms as usize / 1_000;
+                        let timestamp = StreamInstant::from_nanos((833_000 + ms * 1_000) * 1_000);
+                        let mut output = vec![0.0; callback_frames * 2];
+                        (h.callback)(
+                            &mut output,
+                            OutputStreamTimestamp {
+                                callback: timestamp,
+                                playback: timestamp
+                                    + Duration::from_micros(167_000 + presentation_offset_us),
+                            },
+                            OutputTimestampSource::DevicePresentation,
+                            None,
+                            now,
+                        );
+                        for frame in output.chunks_exact(2) {
+                            let expected = [expected_frame as f32 / 2_097_152.0; 2];
+                            assert_eq!(
+                        frame, expected,
+                        "rate={rate} phase={append_phase_ms} requests={requests_ms:?} ms={ms} frame={expected_frame}"
+                    );
+                            expected_frame += 1;
+                        }
+                        presentation_offset_us += request_ms * 1_000;
+                    }
+                }
+                h.worker.step(h.origin + Duration::from_micros(2_833_000));
+                assert_eq!(h.owner.consumed_frames(h.scope), Ok(rate as u64 * 2));
+                assert_eq!(h.diagnostics.snapshot().underrun_frames, 0);
             }
-            h.worker.step(h.origin + Duration::from_micros(2_833_000));
-            assert_eq!(h.owner.consumed_frames(h.scope), Ok(rate as u64 * 2));
-            assert_eq!(h.diagnostics.snapshot().underrun_frames, 0);
         }
     }
 }
@@ -1294,4 +1426,509 @@ fn callback_streaming_replacement_rebuilds_future_pcm() {
     let expected: Vec<_> = (1..=20).chain(1_001..=1_200).collect();
     assert_eq!(actual, expected);
     assert_eq!(h.owner.consumed_frames(h.scope), Ok(220));
+}
+
+#[test]
+fn callback_start_alignment_splits_first_block_at_target_frame() {
+    let mut h = Harness::new(1_000);
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    h.now_us = 828_000; // This block presents at 995ms; source starts at 1000ms.
+    let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    let ids: Vec<_> = data
+        .iter()
+        .step_by(2)
+        .map(|x| (x * 2_097_152.0).round() as i32)
+        .collect();
+    assert_eq!(ids, [0, 0, 0, 0, 0, 1, 2, 3, 4, 5]);
+    assert_eq!(consumed, 5);
+    assert_eq!(h.queue.lock().cursor_us, 1_005_000);
+    assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
+}
+
+#[test]
+fn callback_start_alignment_skips_only_late_source_prefix() {
+    let mut h = Harness::new(1_000);
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    h.now_us = 848_000; // This block presents at 1015ms, 15ms after source start.
+    let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    let ids: Vec<_> = data
+        .iter()
+        .step_by(2)
+        .map(|x| (x * 2_097_152.0).round() as i32)
+        .collect();
+    assert_eq!(ids, (16..=25).collect::<Vec<_>>());
+    assert_eq!(consumed, 25);
+    assert_eq!(h.queue.lock().cursor_us, 1_025_000);
+    assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
+}
+
+#[test]
+fn callback_start_alignment_handles_audio_rates_without_correction_tail() {
+    for rate in [44_100, 48_000] {
+        for offset_us in [-19_000i64, -5_000, 0, 15_000] {
+            let mut h = Harness::new(rate);
+            h.render(OutputTimestampSource::DevicePresentation, 167_000);
+            h.frames = rate as usize / 50;
+            h.now_us = (833_000 + offset_us) as u64;
+            let start_us = h.now_us;
+            let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+            let silent =
+                ((-offset_us).max(0) as u64 * u64::from(rate)).div_ceil(1_000_000) as usize;
+            let skipped = (offset_us.max(0) as u64 * u64::from(rate) / 1_000_000) as usize;
+            let ids: Vec<_> = data
+                .iter()
+                .step_by(2)
+                .map(|x| (x * 2_097_152.0).round() as usize)
+                .collect();
+            assert!(ids[..silent].iter().all(|id| *id == 0));
+            assert_eq!(
+                ids[silent..],
+                (skipped + 1..=skipped + h.frames - silent).collect::<Vec<_>>()
+            );
+            assert_eq!(consumed as usize, skipped + h.frames - silent);
+            assert!(
+                h.diagnostics.snapshot().raw_error_us.unwrap().abs()
+                    <= (1_000_000 / rate + 1) as i64
+            );
+            // Run past the correction filter's warm-up; no delayed correction
+            // may appear merely because the first callback crossed the start.
+            for i in 1..=120 {
+                h.now_us = start_us + i * 20_000;
+                let (_, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+                assert_eq!(consumed, h.frames as u64);
+            }
+            let diagnostic = h.diagnostics.snapshot();
+            assert_eq!(
+                (diagnostic.inserted_frames, diagnostic.dropped_frames),
+                (0, 0)
+            );
+            assert_eq!(diagnostic.underrun_frames, 0);
+        }
+    }
+}
+
+#[test]
+fn callback_start_alignment_after_clear_uses_new_source_only() {
+    let mut h = Harness::new(1_000);
+    h.warm(OutputTimestampSource::DevicePresentation);
+    {
+        let mut queue = h.queue.lock();
+        assert_eq!(
+            h.owner.clear_with_actual(h.scope, || queue.clear()),
+            RendererOperationOutcome::Applied
+        );
+        assert!(matches!(
+            h.owner.enqueue_with_actual(h.scope, 100, || {
+                queue.push(AudioBuffer {
+                    timestamp: 4_000_000,
+                    samples: (10_001..=10_100)
+                        .flat_map(|id| [id * 1024; 2])
+                        .collect::<Vec<_>>()
+                        .into(),
+                    format: AudioFormat {
+                        codec: Codec::Pcm,
+                        sample_rate: 1_000,
+                        channels: 2,
+                        bit_depth: 32,
+                        codec_header: None,
+                    },
+                });
+                (queue.queued_frames(2), queue.buffer_count())
+            }),
+            EnqueueOutcome::Accepted { .. }
+        ));
+    }
+    h.now_us = 3_823_000;
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    h.now_us = 3_828_000;
+    let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    let ids: Vec<_> = data
+        .iter()
+        .step_by(2)
+        .map(|x| (x * 2_097_152.0).round() as i32)
+        .collect();
+    assert_eq!(ids, [0, 0, 0, 0, 0, 10_001, 10_002, 10_003, 10_004, 10_005]);
+    assert_eq!(consumed, 5);
+    assert_eq!(h.queue.lock().cursor_us, 4_005_000);
+    assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
+}
+
+#[test]
+fn callback_start_alignment_large_lateness_keeps_finite_window_budget() {
+    let mut h = Harness::new(1_000);
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    h.now_us = 1_033_000; // 200ms late, more than all prepared windows.
+    let (first, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    assert!(first.iter().all(|s| *s == 0.0));
+    assert!(consumed > 0 && consumed <= 80);
+    let mut caught_up = false;
+    for _ in 0..10 {
+        let presentation = h.now_us + 167_000;
+        let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        assert!(consumed <= 80);
+        if data[0] != 0.0 {
+            assert_eq!(
+                (data[0] * 2_097_152.0).round() as u64,
+                (presentation - 1_000_000) / 1000 + 1
+            );
+            assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
+            caught_up = true;
+            break;
+        }
+    }
+    assert!(caught_up);
+}
+
+#[test]
+fn callback_start_alignment_silence_spans_scratch_blocks() {
+    let mut h = Harness::new(1_000);
+    h.now_us = 773_000;
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    h.frames = 60; // Three scratch blocks; start falls in the third.
+    let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    let ids: Vec<_> = data
+        .iter()
+        .step_by(2)
+        .map(|x| (x * 2_097_152.0).round() as i32)
+        .collect();
+    assert_eq!(&ids[..50], &[0; 50]);
+    assert_eq!(&ids[50..], &(1..=10).collect::<Vec<_>>());
+    assert_eq!(consumed, 10);
+    assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
+}
+
+#[test]
+fn callback_start_alignment_variable_blocks_preserve_source_continuity() {
+    let mut h = Harness::new(44_100);
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    let start_us = 838_000; // First real block is 5ms late.
+    let mut output_frames = 0u64;
+    let mut last_id = 220; // floor(5ms * 44100).
+    for i in 0..160 {
+        h.frames = if i % 2 == 0 { 40 } else { 842 };
+        h.now_us = start_us + output_frames * 1_000_000 / 44_100;
+        let (data, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        let ids: Vec<_> = data
+            .iter()
+            .step_by(2)
+            .map(|x| (x * 2_097_152.0).round() as i32)
+            .collect();
+        assert_eq!(
+            ids,
+            (last_id + 1..=last_id + h.frames as i32).collect::<Vec<_>>()
+        );
+        assert_eq!(consumed, h.frames as u64 + if i == 0 { 220 } else { 0 });
+        last_id += h.frames as i32;
+        output_frames += h.frames as u64;
+    }
+    let snapshot = h.diagnostics.snapshot();
+    assert_eq!(
+        (
+            snapshot.inserted_frames,
+            snapshot.dropped_frames,
+            snapshot.underrun_frames
+        ),
+        (0, 0, 0)
+    );
+    assert!(snapshot.raw_error_us.unwrap().abs() <= 23);
+}
+
+#[test]
+fn callback_start_alignment_retries_when_prefix_exhausts_ready_pcm() {
+    let mut h = Harness::new(1_000);
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    h.now_us = 833_000 + 60_000;
+    let (data, _) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    assert!(data.iter().all(|s| *s == 0.0));
+    let presentation = h.now_us + 167_000;
+    let (data, _) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    assert_eq!(
+        (data[0] * 2_097_152.0).round() as u64,
+        (presentation - 1_000_000) / 1000 + 1
+    );
+    assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
+}
+
+#[test]
+fn media_timeline_future_gap_waits_for_source_time() {
+    assert_media_gap(68, 12, 0);
+}
+
+#[test]
+fn media_timeline_on_time_gap_preserves_source_time() {
+    assert_media_gap(80, 0, 0);
+}
+
+#[test]
+fn media_timeline_gap_inside_callback_pairs_first_real_presentation() {
+    assert_media_gap(68, 12, 5_000);
+}
+
+fn assert_media_gap(resume_tick: i64, lead_ticks: i64, shift_us: i64) {
+    let rate = 48_000;
+    let mut h = Harness::configured(
+        rate,
+        2,
+        RendererQueueLimits::new(96_000, 128, 960).unwrap(),
+        false,
+    );
+    let enqueue = |h: &Harness, chunk: i64| {
+        let buffer = AudioBuffer {
+            timestamp: 1_000_000 + chunk * 20_000 + if chunk >= 40 { shift_us } else { 0 },
+            samples: (chunk * 960 + 1..=(chunk + 1) * 960)
+                .flat_map(|frame| [frame as i32 * 1024; 2])
+                .collect::<Vec<_>>()
+                .into(),
+            format: AudioFormat {
+                codec: Codec::Pcm,
+                sample_rate: rate,
+                channels: 2,
+                bit_depth: 32,
+                codec_header: None,
+            },
+        };
+        let mut queue = h.queue.lock();
+        let publication = queue.publication.clone().unwrap();
+        let outcome = queue
+            .try_enqueue_prepared(&publication, &h.owner, h.scope, (buffer, None), 960)
+            .unwrap_or_else(|_| panic!("admission rejected"));
+        assert!(matches!(outcome, EnqueueOutcome::Accepted { .. }));
+    };
+    for chunk in 0..10 {
+        enqueue(&h, chunk);
+    }
+    h.now_us = 823_000;
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    for tick in 0..82 {
+        if tick >= resume_tick && tick % 2 == 0 {
+            enqueue(&h, (tick + lead_ticks) / 2);
+        }
+        let (output, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        if (20..80).contains(&tick) {
+            assert!(
+                output.iter().all(|sample| *sample == 0.0),
+                "future source played at tick {tick}"
+            );
+            assert_eq!(consumed, 0);
+            assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_200_000)));
+        }
+        if tick == 80 {
+            let silent_frames = (shift_us * 48_000 / 1_000_000) as usize;
+            assert!(output[..silent_frames * 2]
+                .iter()
+                .all(|sample| *sample == 0.0));
+            assert_eq!(
+                (output[silent_frames * 2] * 2_097_152.0).round() as i32,
+                38_401
+            );
+            assert_eq!(
+                h.owner.consumed_frames(h.scope),
+                Ok(10_080 - silent_frames as u64)
+            );
+            assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
+            assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_810_000)));
+        }
+    }
+}
+
+#[test]
+fn media_timeline_44100_short_tail_and_retirement_only_preserve_exact_end() {
+    for retire in [false, true] {
+        let mut h = Harness::configured(
+            44_100,
+            2,
+            RendererQueueLimits::new(2_002, 4, 1_001).unwrap(),
+            false,
+        );
+        {
+            let mut queue = h.queue.lock();
+            let publication = queue.publication.clone().unwrap();
+            let buffer = AudioBuffer {
+                timestamp: 1_000_000,
+                samples: (1..=1001)
+                    .flat_map(|frame| [frame * 1024; 2])
+                    .collect::<Vec<_>>()
+                    .into(),
+                format: AudioFormat {
+                    codec: Codec::Pcm,
+                    sample_rate: 44_100,
+                    channels: 2,
+                    bit_depth: 32,
+                    codec_header: None,
+                },
+            };
+            assert!(matches!(
+                queue
+                    .try_enqueue_prepared(&publication, &h.owner, h.scope, (buffer, None), 1001)
+                    .ok()
+                    .unwrap(),
+                EnqueueOutcome::Accepted { .. }
+            ));
+        }
+        h.now_us = 823_000;
+        h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        for _ in 0..2 {
+            h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        }
+        assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_020_000)));
+        if retire {
+            let mut queue = h.queue.lock();
+            let publication = queue.publication.clone().unwrap();
+            queue
+                .try_reanchor_prepared(&publication, &h.owner, h.scope, || Some(1_030_000), false)
+                .unwrap();
+            assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_020_000)));
+        }
+        let (audio, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        if retire {
+            assert!(audio.iter().all(|sample| *sample == 0.0));
+            assert_eq!(consumed, 0);
+        } else {
+            assert_eq!(consumed, 119);
+            assert_eq!((audio[0] * 2_097_152.0).round() as i32, 883);
+            assert_eq!((audio[236] * 2_097_152.0).round() as i32, 1001);
+            assert!(audio[238..].iter().all(|sample| *sample == 0.0));
+        }
+        assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_022_698)));
+        assert_eq!(
+            h.owner
+                .clear_with_actual(h.scope, || h.queue.lock().clear()),
+            RendererOperationOutcome::Applied
+        );
+        assert!(h
+            .render(OutputTimestampSource::DevicePresentation, 167_000)
+            .0
+            .iter()
+            .all(|sample| *sample == 0.0));
+        assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_022_698)));
+    }
+}
+
+#[test]
+fn media_timeline_entirely_expired_initial_tail_is_disposed_without_audio() {
+    let mut h = Harness::configured(44_100, 2, RendererQueueLimits::new(4, 2, 2).unwrap(), false);
+    {
+        let mut queue = h.queue.lock();
+        let publication = queue.publication.clone().unwrap();
+        let buffer = AudioBuffer {
+            timestamp: 1_000_000,
+            samples: Arc::from([1024, 1024, 2048, 2048]),
+            format: AudioFormat {
+                codec: Codec::Pcm,
+                sample_rate: 44_100,
+                channels: 2,
+                bit_depth: 32,
+                codec_header: None,
+            },
+        };
+        assert!(matches!(
+            queue
+                .try_enqueue_prepared(&publication, &h.owner, h.scope, (buffer, None), 2)
+                .ok()
+                .unwrap(),
+            EnqueueOutcome::Accepted { .. }
+        ));
+    }
+    h.now_us = 2_000_000;
+    for _ in 0..2 {
+        let (audio, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        assert!(audio.iter().all(|sample| *sample == 0.0));
+        assert_eq!(consumed, 0);
+    }
+    assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_000_045)));
+    assert_eq!(h.owner.capacity(h.scope).unwrap().current_frames(), 0);
+}
+
+// T2: prepared queue -> actual callback startup discard must stop at source time,
+// including a discontinuity after an explicit control reanchor.
+#[test]
+fn media_timeline_late_start_waits_at_future_source_after_gap() {
+    for reanchor in [false, true] {
+        assert_late_start_gap(reanchor, 2_000_000);
+    }
+}
+
+#[test]
+fn media_timeline_late_start_reaches_suffix_inside_same_callback() {
+    assert_late_start_gap(false, 1_035_000);
+}
+
+fn assert_late_start_gap(reanchor: bool, suffix_start: i64) {
+    let mut h = Harness::configured(
+        1_000,
+        2,
+        RendererQueueLimits::new(100, 4, 40).unwrap(),
+        false,
+    );
+    for (timestamp, first_id, frames) in [(1_000_000, 1, 20), (suffix_start, 1001, 40)] {
+        let mut queue = h.queue.lock();
+        let publication = queue.publication.clone().unwrap();
+        let buffer = AudioBuffer {
+            timestamp,
+            samples: (first_id..first_id + frames as i32)
+                .flat_map(|id| [id * 1024; 2])
+                .collect::<Vec<_>>()
+                .into(),
+            format: AudioFormat {
+                codec: Codec::Pcm,
+                sample_rate: 1_000,
+                channels: 2,
+                bit_depth: 32,
+                codec_header: None,
+            },
+        };
+        assert!(matches!(
+            queue
+                .try_enqueue_prepared(&publication, &h.owner, h.scope, (buffer, None), frames)
+                .ok()
+                .unwrap(),
+            EnqueueOutcome::Accepted { .. }
+        ));
+    }
+    h.now_us = 823_000; // Warm preparation with presentation 990ms, before source.
+    h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    if reanchor {
+        h.now_us = 833_000;
+        let (_, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        assert_eq!(consumed, 10);
+        let mut queue = h.queue.lock();
+        let publication = queue.publication.clone().unwrap();
+        queue
+            .try_reanchor_prepared(&publication, &h.owner, h.scope, || Some(1_010_000), false)
+            .unwrap();
+        drop(queue);
+        // A pre-target callback returns revoked windows so the real worker can
+        // prepare the reanchored source before the intentionally late callback.
+        h.frames = 1;
+        h.now_us = 834_000;
+        let (silent, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        assert!(silent.iter().all(|sample| *sample == 0.0));
+        assert_eq!(consumed, 0);
+        h.frames = 10;
+    }
+    h.now_us = 863_000; // First (or reanchored) audible presentation is 1030ms.
+    let (audio, _) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+    let ids: Vec<_> = audio
+        .chunks_exact(2)
+        .map(|frame| (frame[0] * 2_097_152.0).round() as i32)
+        .collect();
+    if suffix_start == 2_000_000 {
+        assert_eq!(
+            ids,
+            vec![0; 10],
+            "future suffix must survive late-start discard; reanchor={reanchor}"
+        );
+        assert_eq!(h.owner.consumed_frames(h.scope), Ok(20));
+        assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_020_000)));
+        h.now_us = 1_833_000; // presentation 2000ms: untouched first future frame.
+        let (audio, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        assert_eq!((audio[0] * 2_097_152.0).round() as i32, 1001);
+        assert_eq!(consumed, 10);
+        assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(2_010_000)));
+    } else {
+        assert_eq!(ids, vec![0, 0, 0, 0, 0, 1001, 1002, 1003, 1004, 1005]);
+        assert_eq!(h.owner.consumed_frames(h.scope), Ok(25));
+        assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_040_000)));
+        assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
+    }
 }

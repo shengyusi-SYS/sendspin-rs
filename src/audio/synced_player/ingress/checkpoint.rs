@@ -2,8 +2,10 @@
 //! The existing gate validates coherent non-RT reads; no callback retry or lock.
 
 use super::{CallbackGuard, ControlGate, Observation};
+use crate::audio::player_contract::MediaBoundary;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SourcePosition {
@@ -12,6 +14,7 @@ pub(crate) struct SourcePosition {
     pub index: usize,
     pub cursor_us: i64,
     pub cursor_remainder: i64,
+    pub media_end_us: Option<i64>,
 }
 
 pub(crate) struct Snapshot<'a> {
@@ -28,10 +31,15 @@ pub(crate) struct PublishedCheckpoint {
     index: AtomicUsize,
     cursor_us: AtomicI64,
     cursor_remainder: AtomicI64,
+    media_boundary: Arc<MediaBoundary>,
 }
 
 impl PublishedCheckpoint {
     pub(crate) fn new() -> Self {
+        Self::with_media_boundary(Arc::new(MediaBoundary::default()))
+    }
+
+    pub(crate) fn with_media_boundary(media_boundary: Arc<MediaBoundary>) -> Self {
         Self {
             valid: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
@@ -40,10 +48,14 @@ impl PublishedCheckpoint {
             index: AtomicUsize::new(0),
             cursor_us: AtomicI64::new(0),
             cursor_remainder: AtomicI64::new(0),
+            media_boundary,
         }
     }
 
     pub(crate) fn publish(&self, callback: &CallbackGuard<'_>, position: SourcePosition) {
+        if let Some(end) = position.media_end_us {
+            self.media_boundary.publish(end);
+        }
         callback.publish_current(position.current);
         self.retired_through
             .store(position.retired_through, Ordering::Relaxed);
@@ -92,6 +104,7 @@ impl PublishedCheckpoint {
                 index: self.index.load(Ordering::Relaxed),
                 cursor_us: self.cursor_us.load(Ordering::Relaxed),
                 cursor_remainder: self.cursor_remainder.load(Ordering::Relaxed),
+                media_end_us: self.media_boundary.read(),
             },
         };
         (self.valid.load(Ordering::Acquire) && gate.validate(&snapshot.view)).then_some(snapshot)
@@ -118,6 +131,7 @@ mod tests {
             index: 7,
             cursor_us: -123,
             cursor_remainder: 11,
+            media_end_us: None,
         };
         {
             let callback = gate.begin_callback();

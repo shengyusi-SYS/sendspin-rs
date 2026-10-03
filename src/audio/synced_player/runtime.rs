@@ -12,8 +12,39 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::atomic::{fence, AtomicBool, AtomicI64, AtomicU32, AtomicU8};
 use std::thread::{self, JoinHandle};
 
-pub(super) const WINDOWS: usize = 4;
 pub(super) const OBSERVATIONS: usize = 64;
+
+/// Four callback periods cover at most two source reads per output frame,
+/// one period of late-start prefix and one period of replenishment slack.
+/// The current partial window and control-handoff credit are additional slots.
+/// Unknown/unbounded backend requests need no more than the complete admitted
+/// source horizon: beyond that horizon a callback can genuinely lack source PCM.
+fn delivery_windows(
+    frames: usize,
+    callback_frames: Option<usize>,
+    source_frames: usize,
+) -> Option<usize> {
+    let demand = match callback_frames {
+        Some(0) => return None,
+        Some(callback) => callback
+            .min(source_frames)
+            .checked_mul(4)?
+            .min(source_frames),
+        None => source_frames,
+    };
+    if frames == 0 || demand == 0 {
+        return None;
+    }
+    // With N-1 regular credits and a nearly exhausted head, at least
+    // (N-2)*frames + 1 frames remain after a full producer refill.
+    Some(
+        demand
+            .saturating_sub(1)
+            .div_ceil(frames)
+            .checked_add(2)?
+            .max(4),
+    )
+}
 
 // The payload is all atomic; the outer revision validates one bounded read.
 // Store full Instant magnitudes instead of reducing i64 scheduled boundaries.
@@ -53,6 +84,7 @@ struct Timing {
     generation: u64,
     delay_us: u64,
     expected: Option<Instant>,
+    source_cursor_us: i64,
     boundary: i64,
     boundary_deadline: Option<Instant>,
     valid_until: Option<Instant>,
@@ -66,6 +98,7 @@ pub(super) struct TimingMailbox {
     generation: AtomicU64,
     delay_us: AtomicU64,
     expected: AtomicInstant,
+    source_cursor_us: AtomicI64,
     boundary: AtomicI64,
     boundary_deadline: AtomicInstant,
     valid_until: AtomicInstant,
@@ -80,6 +113,7 @@ impl TimingMailbox {
             generation: AtomicU64::new(0),
             delay_us: AtomicU64::new(0),
             expected: AtomicInstant::default(),
+            source_cursor_us: AtomicI64::new(0),
             boundary: AtomicI64::new(0),
             boundary_deadline: AtomicInstant::default(),
             valid_until: AtomicInstant::default(),
@@ -97,6 +131,8 @@ impl TimingMailbox {
         self.generation.store(value.generation, Ordering::Relaxed);
         self.delay_us.store(value.delay_us, Ordering::Relaxed);
         self.expected.store(self.origin, value.expected);
+        self.source_cursor_us
+            .store(value.source_cursor_us, Ordering::Relaxed);
         self.boundary.store(value.boundary, Ordering::Relaxed);
         self.boundary_deadline
             .store(self.origin, value.boundary_deadline);
@@ -118,6 +154,7 @@ impl TimingMailbox {
             generation: self.generation.load(Ordering::Relaxed),
             delay_us: self.delay_us.load(Ordering::Relaxed),
             expected: self.expected.load(self.origin),
+            source_cursor_us: self.source_cursor_us.load(Ordering::Relaxed),
             boundary: self.boundary.load(Ordering::Relaxed),
             boundary_deadline: self.boundary_deadline.load(self.origin),
             valid_until: self.valid_until.load(self.origin),
@@ -168,6 +205,7 @@ pub(super) struct Worker {
     publication: Arc<Publication>,
     private: PlaybackQueue,
     producer: PrepareSide,
+    windows: usize,
     sample_rate: u32,
     channels: usize,
     delay: Arc<AtomicU64>,
@@ -212,10 +250,13 @@ pub(super) fn build(
     let samples = frames
         .checked_mul(channels)
         .ok_or_else(|| Error::Output("PCM workspace size overflow".into()))?;
+    let windows = delivery_windows(frames, config.max_callback_frames, limits.hard_frames())
+        .ok_or_else(|| Error::Output("invalid PCM delivery capacity".into()))?;
     let preflight = allocation_budget(
         limits,
         channels,
         frames,
+        windows,
         limits.hard_buffers(),
         limits.hard_buffers(),
         None,
@@ -224,7 +265,7 @@ pub(super) fn build(
         [samples; 2],
     )
     .ok_or_else(|| Error::Output("player allocation size overflow".into()))?;
-    let (producer, pipe) = transport::pipe(WINDOWS, frames, channels)
+    let (producer, pipe) = transport::pipe(windows, frames, channels)
         .ok_or_else(|| Error::Output("invalid PCM transport dimensions".into()))?;
     let publication = Publication::new(&owner, scope, channels, limits)
         .map_err(|_| Error::Output("stale renderer publication".into()))?;
@@ -272,6 +313,7 @@ pub(super) fn build(
         publication,
         private,
         producer,
+        windows,
         sample_rate: format.sample_rate,
         channels,
         delay: Arc::clone(&config.static_delay_us),
@@ -298,6 +340,7 @@ pub(super) fn build(
         limits,
         channels,
         frames,
+        windows,
         canonical.queue.capacity(),
         worker.private.queue.capacity(),
         Some(worker.producer.allocation()),
@@ -318,6 +361,7 @@ fn allocation_budget(
     limits: RendererQueueLimits,
     channels: usize,
     frames: usize,
+    windows: usize,
     canonical_capacity: usize,
     private_capacity: usize,
     transport: Option<transport::Allocation>,
@@ -326,7 +370,7 @@ fn allocation_budget(
     scratch_capacities: [usize; 2],
 ) -> Option<Budget> {
     let mut budget = Budget::sources(limits, channels, canonical_capacity, private_capacity)?;
-    budget.add_transport(WINDOWS, frames, channels, transport)?;
+    budget.add_transport(windows, frames, channels, transport)?;
     budget.add_feedback::<Event>(feedback_capacity)?;
     budget.add_inline::<Worker>()?;
     budget.add_inline::<Device>()?;
@@ -350,6 +394,7 @@ fn allocation_budget(
     budget.add_arc::<TimingMailbox>()?;
     budget.add_arc::<AtomicBool>()?; // worker stop
     budget.add_arc::<AtomicU64>()?; // actual consumption
+    budget.add_arc::<crate::audio::player_contract::MediaBoundary>()?;
     budget.add_arc::<AtomicU64>()?; // dynamic delay
     budget.add_arc::<Mutex<SyncDiagnosticsSnapshot>>()?;
     budget.add_array::<i32>(last_capacity)?;
@@ -570,6 +615,7 @@ impl Worker {
                         epoch: self.publication.control.view().epoch(),
                         generation: queue.generation,
                         delay_us: delay,
+                        source_cursor_us: queue.cursor_us,
                         expected: queue
                             .initialized
                             .then(|| {
@@ -598,7 +644,7 @@ impl Worker {
             }
         }
         if self.snapshot.is_some() && !self.owner.needs_terminal_check(self.scope) {
-            for _ in 0..WINDOWS {
+            for _ in 0..self.windows {
                 // Keep one of the existing N credits for a control handoff.
                 // A successful reanchor may use it for its first new window.
                 if self.producer.available_credits() <= usize::from(!use_reserved_credit) {
@@ -752,25 +798,63 @@ impl Device {
         });
         let ready =
             timing.is_some_and(|timing| !timing.pending && timing.epoch >= self.minimum_epoch);
-        if !self.started && ready && timing_valid {
-            if timing
-                .and_then(|timing| timing.expected)
-                .is_some_and(|expected| {
-                    playback
-                        .checked_add(Duration::from_millis(1))
-                        .is_some_and(|time| time >= expected)
-                })
-            {
-                self.started = true;
+        // Source reanchors (including seek) must align their first new sample.
+        if view.timeline_reanchored() {
+            self.started = false;
+        }
+        let mut leading_silence = 0usize;
+        let mut late_frames = 0usize;
+        if !self.started
+            && open
+            && ready
+            && timing_valid
+            && timing.is_some_and(|timing| timing.epoch == view.epoch())
+        {
+            if let Some(expected) = timing.and_then(|timing| timing.expected) {
+                if measured.is_some() {
+                    let boundary = match callback.decide_start(None) {
+                        ScheduledStartOutcome::Waiting { start_at_zone_us } => timing
+                            .filter(|timing| timing.boundary == start_at_zone_us)
+                            .and_then(|timing| timing.boundary_deadline),
+                        _ => None,
+                    };
+                    let start = boundary.map_or(expected, |boundary| expected.max(boundary));
+                    if start > playback {
+                        leading_silence = ((start.duration_since(playback).as_nanos()
+                            * u128::from(sample_rate))
+                        .div_ceil(1_000_000_000))
+                        .min(frames as u128) as usize;
+                    }
+                    if leading_silence < frames {
+                        let first = playback
+                            + Duration::from_secs_f64(
+                                leading_silence as f64 / f64::from(sample_rate),
+                            );
+                        late_frames = ((first.saturating_duration_since(expected).as_nanos()
+                            * u128::from(sample_rate))
+                            / 1_000_000_000)
+                            .min(usize::MAX as u128) as usize;
+                        self.started = true;
+                    }
+                } else if playback
+                    .checked_add(Duration::from_millis(1))
+                    .is_some_and(|time| time >= expected)
+                {
+                    // Preserve estimated-timestamp fallback; do not discard
+                    // source samples based on an unmeasured presentation time.
+                    self.started = true;
+                }
             }
         }
+        let first_presentation =
+            playback + Duration::from_secs_f64(leading_silence as f64 / f64::from(sample_rate));
         let mut audible = open && self.started && ready;
         if audible {
             let presentation = match callback.decide_start(None) {
                 ScheduledStartOutcome::Waiting { start_at_zone_us } => timing
                     .filter(|timing| timing_valid && timing.boundary == start_at_zone_us)
                     .and_then(|timing| timing.boundary_deadline)
-                    .filter(|deadline| playback >= *deadline)
+                    .filter(|deadline| first_presentation >= *deadline)
                     .map(|_| start_at_zone_us),
                 _ => None,
             };
@@ -810,7 +894,51 @@ impl Device {
                 }
             }
         }
+        let source_now = timing.filter(|_| timing_valid).and_then(|timing| {
+            timing.expected.map(|expected| {
+                let delta = if first_presentation >= expected {
+                    first_presentation.duration_since(expected).as_micros() as i128
+                } else {
+                    -(expected.duration_since(first_presentation).as_micros() as i128)
+                };
+                (i128::from(timing.source_cursor_us) + delta)
+                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+            })
+        });
+        self.reader.set_presentation(None, sample_rate, false);
+        if open && ready && timing_valid {
+            self.reader.retire_tail(
+                &mut self.pipe,
+                &callback,
+                &self.publication.checkpoint,
+                &self.publication.consumed,
+                &mut visible,
+            );
+        }
+        if audible && late_frames > 0 {
+            let prefix_ready = source_now.is_some_and(|target_us| {
+                self.reader.discard_start_prefix(
+                    &mut self.pipe,
+                    &callback,
+                    &self.publication.checkpoint,
+                    &self.publication.consumed,
+                    &mut self.pcm[..channels],
+                    target_us,
+                    &mut visible,
+                )
+            });
+            if !prefix_ready {
+                // The next callback re-evaluates against its current source
+                // checkpoint. Never loop beyond the callback-entry budget.
+                self.started = false;
+                audible = false;
+            }
+        }
+        self.reader.set_presentation(source_now, sample_rate, true);
+        let mut remaining_silence = leading_silence;
         let mut origin = None;
+        let mut origin_presentation = None;
+        let mut output_offset = 0usize;
         let mut missing = 0u64;
         let target_gain = config.gain_control.gain();
         for output in data.chunks_mut(self.float.len()) {
@@ -818,18 +946,28 @@ impl Device {
             let usable = length / channels * channels;
             let float = &mut self.float[..length];
             if audible {
+                let silent = remaining_silence.min(usable / channels) * channels;
+                remaining_silence -= silent / channels;
+                float[..silent].fill(0.0);
                 let rendered = self.reader.render_with_budget(
                     &mut self.pipe,
                     &callback,
                     &self.publication.checkpoint,
                     &self.publication.consumed,
-                    &mut self.pcm[..usable],
+                    &mut self.pcm[..usable - silent],
                     measured.is_some(),
                     wanted,
                     &mut visible,
                 );
                 if origin.is_none() {
                     origin = rendered.source_cursor_us;
+                    origin_presentation = rendered.first_output_frame.map(|frame| {
+                        playback
+                            + Duration::from_secs_f64(
+                                (output_offset + silent / channels + frame) as f64
+                                    / f64::from(sample_rate),
+                            )
+                    });
                 }
                 missing = missing.saturating_add(rendered.missing as u64);
                 observation.inserted_frames = observation
@@ -838,7 +976,10 @@ impl Device {
                 observation.dropped_frames = observation
                     .dropped_frames
                     .saturating_add(rendered.dropped as u64);
-                for (out, sample) in float[..usable].iter_mut().zip(&self.pcm[..usable]) {
+                for (out, sample) in float[silent..usable]
+                    .iter_mut()
+                    .zip(&self.pcm[..usable - silent])
+                {
                     *out = f32::from_sample(*sample);
                 }
                 float[usable..].fill(0.0);
@@ -847,6 +988,7 @@ impl Device {
                 self.gain.advance(usable / channels, target_gain);
                 float.fill(0.0);
             }
+            output_offset += usable / channels;
             if let Some(process) = &mut config.process_callback {
                 process(float);
             }
@@ -860,6 +1002,9 @@ impl Device {
             }
         }
         if audible {
+            observation.silent_frames = observation
+                .silent_frames
+                .saturating_add(leading_silence as u64);
             let applied = self.reader.schedule();
             if measured.is_some() {
                 observation.insert_every = applied.insert_every_n_frames;
@@ -880,7 +1025,7 @@ impl Device {
                 timeline,
                 serial: observation.callbacks,
                 source_cursor_us,
-                presentation: measured.map(|_| playback),
+                presentation: measured.and(origin_presentation),
                 actual_schedule: self.reader.schedule(),
             },
         });

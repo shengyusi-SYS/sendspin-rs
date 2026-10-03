@@ -265,7 +265,7 @@ impl ControlGate {
         // Callback completion clears pending in its existing Release operation.
         let _ = self
             .control
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |control| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |control| {
                 Some(closed_control(control))
             });
     }

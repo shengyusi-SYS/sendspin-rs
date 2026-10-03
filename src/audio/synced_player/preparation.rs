@@ -6,6 +6,7 @@ use super::PlaybackQueue;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Frame {
+    pub source_start_us: i64,
     pub before_current: u64,
     pub before_index: usize,
     pub requires_epoch: bool,
@@ -15,6 +16,7 @@ pub(super) struct Frame {
 impl Default for Frame {
     fn default() -> Self {
         Self {
+            source_start_us: 0,
             before_current: 0,
             before_index: 0,
             requires_epoch: true,
@@ -24,6 +26,7 @@ impl Default for Frame {
                 index: 0,
                 cursor_us: 0,
                 cursor_remainder: 0,
+                media_end_us: None,
             },
         }
     }
@@ -32,7 +35,6 @@ impl Default for Frame {
 pub(super) struct Window {
     pub epoch: u64,
     pub source_base: u64,
-    pub cursor_before: Option<i64>,
     pub frames: Vec<Frame>,
     pub pcm: Vec<i32>,
     pub valid: usize,
@@ -51,7 +53,6 @@ impl Window {
         Some(Self {
             epoch: 0,
             source_base: 0,
-            cursor_before: None,
             frames: vec![Frame::default(); frames],
             pcm: vec![0; samples],
             valid: 0,
@@ -68,6 +69,7 @@ impl PlaybackQueue {
             index: self.index,
             cursor_us: self.cursor_us,
             cursor_remainder: self.cursor_remainder,
+            media_end_us: self.media_end_us,
         }
     }
 
@@ -86,6 +88,8 @@ impl PlaybackQueue {
         destination.index = self.index;
         destination.cursor_us = self.cursor_us;
         destination.cursor_remainder = self.cursor_remainder;
+        destination.frame_start_us = self.frame_start_us;
+        destination.media_end_us = self.media_end_us;
         destination.initialized = self.initialized;
         destination.generation = self.generation;
         destination.force_reanchor = self.force_reanchor;
@@ -127,6 +131,7 @@ impl PlaybackQueue {
         self.index = position.index;
         self.cursor_us = position.cursor_us;
         self.cursor_remainder = position.cursor_remainder;
+        self.media_end_us = position.media_end_us;
     }
 
     pub(super) fn prepare_window(
@@ -140,7 +145,6 @@ impl PlaybackQueue {
         assert_eq!(window.pcm.len(), window.frames.len() * channels);
         window.epoch = epoch;
         window.source_base = source_base;
-        window.cursor_before = self.initialized.then_some(self.cursor_us);
         window.valid = 0;
         window.skipped_tail = None;
         for index in 0..window.frames.len() {
@@ -154,6 +158,7 @@ impl PlaybackQueue {
                 Some(&mut window.pcm[index * channels..(index + 1) * channels]),
             );
             let frame = Frame {
+                source_start_us: self.frame_start_us,
                 before_current: before.current,
                 before_index: before.index,
                 requires_epoch: remaining == 0,

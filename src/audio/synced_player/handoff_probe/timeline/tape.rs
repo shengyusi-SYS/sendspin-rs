@@ -1302,7 +1302,7 @@ fn realtime_handoff_probe_tape_preparer_uses_ledger_for_append_overlap_and_clear
 }
 
 #[test]
-fn realtime_handoff_probe_tape_reanchor_rebuilds_current_time_without_clearing_current_pcm() {
+fn realtime_handoff_probe_tape_reanchor_retires_expired_current_and_resumes_actual_source() {
     use super::super::admission::SourceLedger;
     use crate::audio::EnqueueOutcome;
     let checkpoint = Arc::new(PublishedCheckpoint::new(1));
@@ -1350,7 +1350,7 @@ fn realtime_handoff_probe_tape_reanchor_rebuilds_current_time_without_clearing_c
         device.render(&mut tail, false, CorrectionSchedule::default()),
         0
     );
-    assert_eq!(tail, [2, 3, 4, 23]);
+    assert_eq!(tail, [20, 21, 22, 23]);
     let actual = device
         .checkpoint
         .read(&device.pipe.gate, &device.pipe.progress)
@@ -2093,7 +2093,7 @@ fn realtime_handoff_probe_tape_feedback_origin_tracks_initial_clear_and_reanchor
         (observation.timeline, observation.source_cursor_us),
         (view.epoch(), 10_000)
     );
-    ledger.try_reanchor(&gate, 20_000).unwrap();
+    ledger.try_reanchor(&gate, 11_000).unwrap();
     let (view, mut source) = ledger.preparation(&gate).unwrap();
     assert!(producer
         .publish(prepare_tape(&mut source, view.epoch(), 1, 2))
@@ -2105,12 +2105,12 @@ fn realtime_handoff_probe_tape_feedback_origin_tracks_initial_clear_and_reanchor
     assert_eq!(
         output,
         [20],
-        "reanchor preserves the partially consumed current"
+        "reanchor resumes the current at its actual source timestamp"
     );
     let observation = rx.pop().unwrap();
     assert_eq!(
         (observation.timeline, observation.source_cursor_us),
-        (view.epoch(), 20_000)
+        (view.epoch(), 11_000)
     );
     assert_eq!(producer.reclaim(), 2);
     assert_eq!(
@@ -2704,7 +2704,7 @@ fn realtime_handoff_probe_tape_delayed_reanchor_needs_time_not_consumption_delta
             preparation_delay_us >= 500_000,
             "post-commit preparation delay remains a real error, not hidden by consumption"
         );
-        assert_eq!(tail, [4, 21, 22, 23]);
+        assert_eq!(tail, [20, 21, 22, 23]);
         ledger.try_reconcile(&device.pipe.gate).unwrap();
         assert_eq!(ledger.owner.consumed_frames(ledger.scope), Ok(7));
         assert_eq!(

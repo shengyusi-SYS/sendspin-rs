@@ -7,7 +7,7 @@ use cpal::{OutputTimestampSource, Stream};
 #[cfg(test)]
 use parking_lot::MutexGuard;
 use parking_lot::{Condvar, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 const CALLBACK_CLOSED: u64 = 1 << 63;
@@ -534,6 +534,25 @@ impl RendererHealthSnapshot {
     }
 }
 
+/// Single callback writer; monotonic scalar remains readable after terminal.
+#[derive(Debug, Default)]
+pub(crate) struct MediaBoundary {
+    valid: AtomicBool,
+    value: AtomicI64,
+}
+impl MediaBoundary {
+    pub(crate) fn publish(&self, value: i64) {
+        let value = self.read().map_or(value, |old| old.max(value));
+        self.value.store(value, Ordering::Release);
+        self.valid.store(true, Ordering::Release);
+    }
+    pub(crate) fn read(&self) -> Option<i64> {
+        self.valid
+            .load(Ordering::Acquire)
+            .then(|| self.value.load(Ordering::Acquire))
+    }
+}
+
 #[derive(Debug)]
 struct ScopeState {
     scope: PlayerScope,
@@ -542,6 +561,7 @@ struct ScopeState {
     high_water_frames: usize,
     high_water_buffers: usize,
     consumed_frames: Arc<AtomicU64>,
+    media_boundary: Arc<MediaBoundary>,
     last_boundary: Option<i64>,
     fault: Option<RendererFault>,
     terminal: Option<RendererTerminal>,
@@ -560,6 +580,7 @@ impl ScopeState {
             high_water_frames: 0,
             high_water_buffers: 0,
             consumed_frames: Arc::new(AtomicU64::new(0)),
+            media_boundary: Arc::new(MediaBoundary::default()),
             last_boundary: None,
             fault: None,
             terminal: None,
@@ -620,7 +641,7 @@ impl ScopeState {
     fn add_consumed_frames(&self, frames: usize) {
         let _ = self
             .consumed_frames
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_add(frames as u64))
             });
     }
@@ -982,7 +1003,7 @@ impl RendererOwner {
         }
         self.shared
             .callback_state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 if state & CALLBACK_CLOSED != 0 {
                     None
                 } else {
@@ -1044,7 +1065,7 @@ impl RendererOwner {
         }
         self.shared
             .timestamp_telemetry_state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 let version = state & TIMESTAMP_TELEMETRY_VERSION_MASK;
                 if state & TIMESTAMP_TELEMETRY_FLAGS != 0 || version & 1 != 0 {
                     None
@@ -1063,7 +1084,7 @@ impl RendererOwner {
     }
 
     pub(crate) fn record_callback_underrun(&self, frames: u64) {
-        let _ = self.shared.underrun_frames.fetch_update(
+        let _ = self.shared.underrun_frames.try_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |current| Some(current.saturating_add(frames)),
@@ -1264,6 +1285,19 @@ impl RendererOwner {
         Ok(Arc::clone(&state.consumed_frames))
     }
 
+    pub(crate) fn media_boundary_publisher(
+        &self,
+        scope: PlayerScope,
+    ) -> Result<Arc<MediaBoundary>, RendererOperationOutcome> {
+        let owner = self.shared.state.lock();
+        let state = owner
+            .current
+            .as_ref()
+            .filter(|state| state.scope == scope)
+            .ok_or(RendererOperationOutcome::StaleScope)?;
+        Ok(Arc::clone(&state.media_boundary))
+    }
+
     /// Settle actual queue capacity on the serialized non-RT source side.
     /// Applied never adds consumption or raises admission high-water marks.
     /// Closed/StaleScope leave all accounting and boundary fields unchanged.
@@ -1389,6 +1423,15 @@ impl RendererOwner {
             .filter(|state| state.scope == scope)
             .ok_or(RendererOperationOutcome::StaleScope)?;
         Ok(state.consumed_frames.load(Ordering::Acquire))
+    }
+
+    /// Actual source media disposed by this scope, independent of consumption.
+    pub fn media_boundary_us(
+        &self,
+        scope: PlayerScope,
+    ) -> Result<Option<i64>, RendererOperationOutcome> {
+        self.media_boundary_publisher(scope)
+            .map(|boundary| boundary.read())
     }
 
     /// Read the current scope's complete typed health snapshot.
@@ -1803,7 +1846,7 @@ fn finalized_outcome(owner: &OwnerState, scope: PlayerScope, already: bool) -> T
 }
 
 fn saturating_increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_add(1))
     });
 }
@@ -1816,7 +1859,7 @@ impl Drop for TimestampTelemetryWriter<'_> {
     fn drop(&mut self) {
         let _ = self
             .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 let flags = state & TIMESTAMP_TELEMETRY_FLAGS;
                 let version = state & TIMESTAMP_TELEMETRY_VERSION_MASK;
                 Some(flags | (version.wrapping_add(1) & TIMESTAMP_TELEMETRY_VERSION_MASK))
