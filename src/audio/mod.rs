@@ -20,7 +20,8 @@ pub mod types;
 
 pub use gain::GainControl;
 pub use player_contract::{
-    EnqueueOutcome, OpenError, OutputBackendError, OutputTimestampEvidenceSnapshot, PlayerScope,
+    EnqueueOutcome, OpenError, OutputBackendError, OutputRouteObservation,
+    OutputTimestampEvidenceSnapshot, PlayerScope,
     PreStartAbortOutcome, RendererCapacitySnapshot, RendererFault, RendererHealthSnapshot,
     RendererOperationOutcome, RendererOwner, RendererQueueLimits, RendererQueueLimitsError,
     RendererTerminal, ScheduledArmOutcome, ScheduledStartOutcome, ScopeMintError, StartState,

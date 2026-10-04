@@ -3,7 +3,7 @@
 
 use crate::audio::synced_player::ingress::ControlGate;
 use cpal::traits::StreamTrait;
-use cpal::{OutputTimestampSource, Stream};
+use cpal::{DeviceId, OutputTimestampSource, Stream};
 #[cfg(test)]
 use parking_lot::MutexGuard;
 use parking_lot::{Condvar, Mutex};
@@ -172,6 +172,19 @@ pub enum RendererOperationOutcome {
     /// The current scope is closed or finalizing/finalized.
     Closed,
     /// The supplied scope is not current.
+    StaleScope,
+}
+
+/// Point-in-time actual route observation for one renderer scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputRouteObservation {
+    /// The backend reported this device for the scope's owned output stream.
+    Device(DeviceId),
+    /// No stream is attached yet, or the backend cannot report an actual device.
+    Unknown,
+    /// The current scope has closed or begun terminal finalization.
+    Closed,
+    /// The supplied scope is no longer current.
     StaleScope,
 }
 
@@ -790,6 +803,35 @@ impl RendererOwner {
         stream: Stream,
     ) -> RendererOperationOutcome {
         self.attach_owned_resource(scope, OwnedTerminalResource::Stream(stream))
+    }
+
+    /// Observe the original owned output stream without starting or replacing it.
+    ///
+    /// Call only from non-audio-callback code. The owner lock fences the scope,
+    /// stream query, and teardown together. This snapshot does not promise that
+    /// the route or scope will remain unchanged after the method returns.
+    /// Backend failures are returned separately from an unavailable identity.
+    pub fn output_route(&self, scope: PlayerScope) -> Result<OutputRouteObservation, OutputBackendError> {
+        let owner = self.shared.state.lock();
+        let Some(state) = owner.current.as_ref() else {
+            return Ok(OutputRouteObservation::StaleScope);
+        };
+        if state.scope != scope {
+            return Ok(OutputRouteObservation::StaleScope);
+        }
+        if !state.accepting || state.terminal_state != TerminalState::Open {
+            return Ok(OutputRouteObservation::Closed);
+        }
+        let Some((resource_scope, OwnedTerminalResource::Stream(stream))) = owner.terminal_resource.as_ref() else {
+            return Ok(OutputRouteObservation::Unknown);
+        };
+        if *resource_scope != scope {
+            return Ok(OutputRouteObservation::StaleScope);
+        }
+        stream
+            .actual_output_device_id()
+            .map(|device| device.map_or(OutputRouteObservation::Unknown, OutputRouteObservation::Device))
+            .map_err(|error| OutputBackendError::new(error.to_string()))
     }
 
     /// Start the concrete stream already owned by this scope's terminal finalizer.
@@ -1921,6 +1963,36 @@ mod tests {
     use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    // T0: production owner lifecycle, no device or substitute stream.
+    #[test]
+    fn output_route_observation_unattached_scope_is_unknown() {
+        let owner = RendererOwner::new(RendererQueueLimits::new(32, 8, 16).unwrap());
+        let scope = owner.mint_scope().unwrap();
+        assert_eq!(owner.output_route(scope), Ok(super::OutputRouteObservation::Unknown));
+    }
+
+    #[test]
+    fn output_route_observation_closed_scope_hides_route() {
+        let owner = RendererOwner::new(RendererQueueLimits::new(32, 8, 16).unwrap());
+        let scope = owner.mint_scope().unwrap();
+        owner.close(scope);
+        assert_eq!(owner.output_route(scope), Ok(super::OutputRouteObservation::Closed));
+    }
+
+    #[test]
+    fn output_route_observation_teardown_and_replacement_fence_old_scope() {
+        let owner = RendererOwner::new(RendererQueueLimits::new(32, 8, 16).unwrap());
+        let scope = owner.mint_scope().unwrap();
+        owner.teardown(scope);
+        assert_eq!(owner.output_route(scope), Ok(super::OutputRouteObservation::Closed));
+        let replacement = owner.mint_scope().unwrap();
+        assert_eq!(owner.output_route(scope), Ok(super::OutputRouteObservation::StaleScope));
+        assert_eq!(
+            owner.output_route(replacement),
+            Ok(super::OutputRouteObservation::Unknown)
+        );
+    }
 
     #[test]
     fn renderer_realtime_owner_reads_actual_consumption_without_reconciliation_backfill() {
