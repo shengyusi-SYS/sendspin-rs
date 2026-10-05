@@ -1552,6 +1552,10 @@ fn record_output_error(renderer: &RendererOwner, scope: PlayerScope, error: &Mut
             log::warn!("Audio thread priority promotion failed (non-fatal): {err}");
             return;
         }
+        cpal::ErrorKind::Xrun => {
+            log::warn!("Audio underrun reported; backend retains the stream: {err}");
+            return;
+        }
         cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated => RendererFault::OutputInvalidated,
         _ => RendererFault::CallbackFailed,
     };
@@ -1586,7 +1590,7 @@ mod tests {
 
     #[test]
     fn output_terminal_contract_nonfatal_route_and_priority_keep_stream_active() {
-        for kind in [cpal::ErrorKind::DeviceChanged, cpal::ErrorKind::RealtimeDenied] {
+        for kind in [cpal::ErrorKind::DeviceChanged, cpal::ErrorKind::RealtimeDenied, cpal::ErrorKind::Xrun] {
             let owner = RendererOwner::new(RendererQueueLimits::new(8, 2, 4).unwrap());
             let scope = owner.mint_scope().unwrap();
             let error = Mutex::new(None);
