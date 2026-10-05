@@ -1410,21 +1410,7 @@ impl SyncedPlayer {
                             );
                         });
                     },
-                    move |err| {
-                        // cpal reports a refused real-time promotion as
-                        // RealtimeDenied ("Audio will still play"); playback
-                        // continues at normal priority. Warn without storing:
-                        // take_error()/has_error() signal fatal stream
-                        // failures, and a consumer must not tear down a
-                        // working stream over a scheduling downgrade.
-                        if err.kind() == cpal::ErrorKind::RealtimeDenied {
-                            log::warn!("Audio thread priority promotion failed (non-fatal): {err}");
-                            return;
-                        }
-                        log::error!("Audio stream error: {err}");
-                        *error.lock() = Some(err.to_string());
-                        let _ = renderer_for_error.fault(scope, RendererFault::CallbackFailed);
-                    },
+                    move |err| record_output_error(&renderer_for_error, scope, &error, err),
                 )
                 .map_err(|e| Error::Output(e.to_string()));
                 if result.is_err() {
@@ -1556,6 +1542,24 @@ impl Drop for SyncedPlayer {
     }
 }
 
+fn record_output_error(renderer: &RendererOwner, scope: PlayerScope, error: &Mutex<Option<String>>, err: cpal::Error) {
+    let fault = match err.kind() {
+        cpal::ErrorKind::DeviceChanged => {
+            log::info!("Audio output rerouted without stopping: {err}");
+            return;
+        }
+        cpal::ErrorKind::RealtimeDenied => {
+            log::warn!("Audio thread priority promotion failed (non-fatal): {err}");
+            return;
+        }
+        cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated => RendererFault::OutputInvalidated,
+        _ => RendererFault::CallbackFailed,
+    };
+    log::error!("Audio stream error: {err}");
+    *error.lock() = Some(err.to_string());
+    let _ = renderer.fault(scope, fault);
+}
+
 #[cfg(test)]
 mod tests {
     // Note: SyncedPlayer's convenience methods (volume, is_muted, set_volume,
@@ -1579,6 +1583,68 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{mpsc, Arc};
     use std::thread;
+
+    #[test]
+    fn output_terminal_contract_nonfatal_route_and_priority_keep_stream_active() {
+        for kind in [cpal::ErrorKind::DeviceChanged, cpal::ErrorKind::RealtimeDenied] {
+            let owner = RendererOwner::new(RendererQueueLimits::new(8, 2, 4).unwrap());
+            let scope = owner.mint_scope().unwrap();
+            let error = Mutex::new(None);
+            super::record_output_error(&owner, scope, &error, cpal::Error::new(kind));
+            assert_eq!(owner.health(scope).unwrap().fault(), None, "{kind:?}");
+            assert!(error.lock().is_none(), "{kind:?}");
+            assert_eq!(owner.close(scope), RendererOperationOutcome::Applied);
+        }
+    }
+
+    #[test]
+    fn output_terminal_contract_unavailable_output_preserves_invalidation() {
+        for kind in [cpal::ErrorKind::DeviceNotAvailable, cpal::ErrorKind::StreamInvalidated] {
+            let owner = RendererOwner::new(RendererQueueLimits::new(8, 2, 4).unwrap());
+            let scope = owner.mint_scope().unwrap();
+            let error = Mutex::new(None);
+            super::record_output_error(&owner, scope, &error, cpal::Error::new(kind));
+            assert_eq!(
+                owner.health(scope).unwrap().fault(),
+                Some(RendererFault::OutputInvalidated)
+            );
+            assert!(error.lock().is_some());
+        }
+    }
+
+    #[test]
+    fn output_terminal_contract_other_failure_remains_terminal() {
+        let owner = RendererOwner::new(RendererQueueLimits::new(8, 2, 4).unwrap());
+        let scope = owner.mint_scope().unwrap();
+        let error = Mutex::new(None);
+        super::record_output_error(&owner, scope, &error, cpal::Error::new(cpal::ErrorKind::BackendError));
+        assert_eq!(
+            owner.health(scope).unwrap().fault(),
+            Some(RendererFault::CallbackFailed)
+        );
+        assert!(error.lock().is_some());
+    }
+
+    #[test]
+    fn output_terminal_contract_finalization_preserves_scope_media_boundary() {
+        for boundary in [None, Some(123_456)] {
+            let owner = RendererOwner::new(RendererQueueLimits::new(8, 2, 4).unwrap());
+            let scope = owner.mint_scope().unwrap();
+            if let Some(boundary) = boundary {
+                owner.media_boundary_publisher(scope).unwrap().publish(boundary);
+            }
+            let error = Mutex::new(None);
+            super::record_output_error(
+                &owner, scope, &error, cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable),
+            );
+            let first = owner.teardown(scope).finalization().unwrap();
+            assert_eq!(owner.media_boundary_us(scope), Ok(boundary));
+            assert_eq!(owner.teardown(scope).finalization(), Some(first));
+            let replacement = owner.mint_scope().unwrap();
+            assert_eq!(owner.media_boundary_us(scope), Err(RendererOperationOutcome::StaleScope));
+            assert_eq!(owner.media_boundary_us(replacement), Ok(None));
+        }
+    }
 
     #[test]
     fn output_callback_capacity_matches_actual_stream_and_unknown_bound() {
