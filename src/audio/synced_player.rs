@@ -256,39 +256,53 @@ fn render_output_channels<T: cpal::Sample>(
     }
 }
 
-fn preflight_device_output_format(device: &Device, format: &AudioFormat) -> Result<u16, OpenError> {
+fn preflight_device_output_format(
+    device: &Device,
+    format: &AudioFormat,
+) -> Result<cpal::SupportedStreamConfig, OpenError> {
     let default_config = device
         .default_output_config()
         .map_err(|error| OpenError::Backend(OutputBackendError::new(error.to_string())))?;
-    if !matches!(
-        default_config.sample_format(),
-        SampleFormat::F32
-            | SampleFormat::F64
-            | SampleFormat::I8
-            | SampleFormat::I16
-            | SampleFormat::I24
-            | SampleFormat::I32
-            | SampleFormat::I64
-            | SampleFormat::U8
-            | SampleFormat::U16
-            | SampleFormat::U32
-            | SampleFormat::U64
-    ) {
-        return Err(OpenError::UnsupportedFormat);
-    }
     let supported = device
         .supported_output_configs()
         .map_err(|error| OpenError::Backend(OutputBackendError::new(error.to_string())))?;
-    select_output_channels(
+    select_device_output_config(format, default_config.sample_format(), supported)
+}
+
+fn select_device_output_config(
+    format: &AudioFormat,
+    preferred_sample_format: SampleFormat,
+    supported: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
+) -> Result<cpal::SupportedStreamConfig, OpenError> {
+    let candidates: Vec<_> = supported
+        .filter(|range| {
+            matches!(
+                range.sample_format(),
+                SampleFormat::F32
+                    | SampleFormat::F64
+                    | SampleFormat::I8
+                    | SampleFormat::I16
+                    | SampleFormat::I24
+                    | SampleFormat::I32
+                    | SampleFormat::I64
+                    | SampleFormat::U8
+                    | SampleFormat::U16
+                    | SampleFormat::U32
+                    | SampleFormat::U64
+            ) && range.min_sample_rate() <= format.sample_rate
+                && format.sample_rate <= range.max_sample_rate()
+        })
+        .collect();
+    let channels = select_output_channels(
         u16::from(format.channels),
-        supported
-            .filter(|range| {
-                range.sample_format() == default_config.sample_format()
-                    && range.min_sample_rate() <= format.sample_rate
-                    && format.sample_rate <= range.max_sample_rate()
-            })
-            .map(|range| range.channels()),
-    )
+        candidates.iter().map(|range| range.channels()),
+    )?;
+    candidates
+        .into_iter()
+        .filter(|range| range.channels() == channels)
+        .min_by_key(|range| range.sample_format() != preferred_sample_format)
+        .map(|range| range.with_sample_rate(format.sample_rate))
+        .ok_or(OpenError::UnsupportedFormat)
 }
 
 /// Frames for [`WINDOWS_DEFAULT_BUFFER_MS`] at `sample_rate`.
@@ -968,15 +982,10 @@ impl SyncedPlayer {
     ) -> Result<Self, OpenError> {
         validate_output_format(&format)?;
         let device = config.device;
-        let output_channels = preflight_device_output_format(&device, &format)?;
-
-        let stream_config = StreamConfig {
-            channels: output_channels,
-            sample_rate: cpal::SampleRate::from(format.sample_rate),
-            buffer_size: match config.buffer_size {
-                Some(frames) => cpal::BufferSize::Fixed(frames),
-                None => default_buffer_size(format.sample_rate),
-            },
+        let output_config = preflight_device_output_format(&device, &format)?;
+        let buffer_size = match config.buffer_size {
+            Some(frames) => cpal::BufferSize::Fixed(frames),
+            None => default_buffer_size(output_config.sample_rate()),
         };
 
         let queue = Arc::new(Mutex::new(PlaybackQueue::new()));
@@ -1017,7 +1026,8 @@ impl SyncedPlayer {
         let diagnostics = SyncDiagnosticsReader::new(Arc::clone(&clock_sync));
         let stream = Self::build_stream(
             &device,
-            &stream_config,
+            &output_config,
+            buffer_size,
             queue_clone,
             Arc::clone(&clock_sync),
             format_clone,
@@ -1350,7 +1360,8 @@ impl SyncedPlayer {
 
     fn build_stream(
         device: &Device,
-        config: &StreamConfig,
+        device_config: &cpal::SupportedStreamConfig,
+        buffer_size: cpal::BufferSize,
         queue: Arc<Mutex<PlaybackQueue>>,
         clock_sync: Arc<Mutex<ClockSync>>,
         format: AudioFormat,
@@ -1363,14 +1374,9 @@ impl SyncedPlayer {
             renderer,
             scope,
         } = outputs;
-        let device_config = device
-            .default_output_config()
-            .map_err(|e| Error::Output(e.to_string()))?;
         let mut stream_config = device_config.config();
-        stream_config.buffer_size = config.buffer_size;
-        stream_config.channels = config.channels;
-        let mono_to_stereo = format.channels == 1 && config.channels == 2;
-        stream_config.sample_rate = format.sample_rate;
+        stream_config.buffer_size = buffer_size;
+        let mono_to_stereo = format.channels == 1 && stream_config.channels == 2;
         cb_config.max_callback_frames = output_callback_capacity(
             &stream_config,
             device_config.sample_format(),
@@ -1648,6 +1654,36 @@ mod tests {
             assert_eq!(owner.media_boundary_us(scope), Err(RendererOperationOutcome::StaleScope));
             assert_eq!(owner.media_boundary_us(replacement), Ok(None));
         }
+    }
+
+    #[test]
+    fn audio_path_output_config_accepts_nondefault_sample_format() {
+        use cpal::{SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
+        let candidates = [
+            SupportedStreamConfigRange::new(
+                2,
+                44_100,
+                44_100,
+                SupportedBufferSize::Unknown,
+                SampleFormat::F32,
+            ),
+            SupportedStreamConfigRange::new(
+                2,
+                48_000,
+                96_000,
+                SupportedBufferSize::Unknown,
+                SampleFormat::I16,
+            ),
+        ];
+        let selected = super::select_device_output_config(
+            &test_format(),
+            SampleFormat::F32,
+            candidates.into_iter(),
+        )
+        .expect("a nondefault sample format supports the requested rate and channels");
+        assert_eq!(selected.sample_rate(), 48_000);
+        assert_eq!(selected.channels(), 2);
+        assert_eq!(selected.sample_format(), SampleFormat::I16);
     }
 
     #[test]
