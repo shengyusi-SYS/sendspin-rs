@@ -9,6 +9,7 @@ use parking_lot::MutexGuard;
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 const CALLBACK_CLOSED: u64 = 1 << 63;
 const CALLBACK_COUNT_MASK: u64 = !CALLBACK_CLOSED;
@@ -428,6 +429,34 @@ impl RendererCapacitySnapshot {
     }
 }
 
+/// The first real media frame in an output callback and its matching device time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FramePresentation {
+    pub(crate) media_timestamp_us: i64,
+    pub(crate) presented_at: Instant,
+    pub(crate) observed_at: Instant,
+    pub(crate) timestamp_source: OutputTimestampSource,
+}
+
+impl FramePresentation {
+    /// Timestamp in the enqueued media timeline, in microseconds.
+    pub fn media_timestamp_us(self) -> i64 {
+        self.media_timestamp_us
+    }
+    /// Local presentation instant for this particular frame.
+    pub fn presented_at(self) -> Instant {
+        self.presented_at
+    }
+    /// Local callback instant, for assessing freshness independently of output latency.
+    pub fn observed_at(self) -> Instant {
+        self.observed_at
+    }
+    /// Host provenance of the paired presentation timestamp.
+    pub fn timestamp_source(self) -> OutputTimestampSource {
+        self.timestamp_source
+    }
+}
+
 /// Owner-generated same-callback output timestamp evidence.
 ///
 /// ```compile_fail
@@ -575,6 +604,7 @@ struct ScopeState {
     high_water_buffers: usize,
     consumed_frames: Arc<AtomicU64>,
     media_boundary: Arc<MediaBoundary>,
+    frame_presentation: Option<(u64, FramePresentation)>,
     last_boundary: Option<i64>,
     fault: Option<RendererFault>,
     terminal: Option<RendererTerminal>,
@@ -594,6 +624,7 @@ impl ScopeState {
             high_water_buffers: 0,
             consumed_frames: Arc::new(AtomicU64::new(0)),
             media_boundary: Arc::new(MediaBoundary::default()),
+            frame_presentation: None,
             last_boundary: None,
             fault: None,
             terminal: None,
@@ -660,6 +691,7 @@ impl ScopeState {
     }
 
     fn clear_queued_state(&mut self) {
+        self.frame_presentation = None;
         self.queued_frames = 0;
         self.queued_buffers = 0;
         if !matches!(self.control.start_state(), StartState::BoundaryWon { .. }) {
@@ -1474,6 +1506,38 @@ impl RendererOwner {
     ) -> Result<Option<i64>, RendererOperationOutcome> {
         self.media_boundary_publisher(scope)
             .map(|boundary| boundary.read())
+    }
+
+    /// Read the latest same-frame observation from this renderer's active timeline.
+    /// Quiet callbacks, fallback timestamps and cleared timelines yield no observation.
+    pub fn frame_presentation(
+        &self,
+        scope: PlayerScope,
+    ) -> Result<Option<FramePresentation>, RendererOperationOutcome> {
+        let owner = self.shared.state.lock();
+        let state = owner
+            .current
+            .as_ref()
+            .filter(|state| state.scope == scope)
+            .ok_or(RendererOperationOutcome::StaleScope)?;
+        Ok(state
+            .frame_presentation
+            .filter(|(epoch, _)| state.accepting && state.control.view().epoch() == *epoch)
+            .map(|(_, frame)| frame))
+    }
+
+    pub(crate) fn publish_frame_presentation(
+        &self,
+        scope: PlayerScope,
+        epoch: u64,
+        frame: Option<FramePresentation>,
+    ) {
+        let mut owner = self.shared.state.lock();
+        if let Some(state) = owner.current.as_mut().filter(|state| {
+            state.scope == scope && state.accepting && state.control.view().epoch() == epoch
+        }) {
+            state.frame_presentation = frame.map(|frame| (epoch, frame));
+        }
     }
 
     /// Read the current scope's complete typed health snapshot.

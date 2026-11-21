@@ -5,10 +5,10 @@ use crate::audio::gain::{GainControl, GainRamp};
 #[cfg(test)]
 use crate::audio::player_contract::RendererCallbackPermit;
 use crate::audio::player_contract::{
-    EnqueueOutcome, OpenError, OutputBackendError, PlayerScope, PreStartAbortOutcome,
-    RendererCapacitySnapshot, RendererFault, RendererHealthSnapshot, RendererOperationOutcome,
-    RendererOwner, RendererQueueLimits, ScheduledArmOutcome, ScheduledStartOutcome, StartState,
-    TerminalOutcome,
+    EnqueueOutcome, FramePresentation, OpenError, OutputBackendError, PlayerScope,
+    PreStartAbortOutcome, RendererCapacitySnapshot, RendererFault, RendererHealthSnapshot,
+    RendererOperationOutcome, RendererOwner, RendererQueueLimits, ScheduledArmOutcome,
+    ScheduledStartOutcome, StartState, TerminalOutcome,
 };
 use crate::audio::{AudioBuffer, AudioFormat, SyncDiagnosticsReader, SyncDiagnosticsSnapshot};
 use crate::error::Error;
@@ -1239,6 +1239,14 @@ impl SyncedPlayer {
         self.renderer.media_boundary_us(self.scope)
     }
 
+    /// The last callback's paired media/device observation for this active output.
+    pub fn frame_presentation(
+        &self,
+    ) -> Result<Option<FramePresentation>, RendererOperationOutcome> {
+        self.renderer.frame_presentation(self.scope)
+    }
+
+    /// Count media frames consumed by this renderer scope.
     pub fn consumed_frames(&self) -> Result<u64, RendererOperationOutcome> {
         self.renderer.consumed_frames(self.scope)
     }

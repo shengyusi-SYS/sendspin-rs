@@ -168,6 +168,8 @@ impl TimingMailbox {
 
 #[derive(Clone, Copy)]
 pub(super) struct Event {
+    control_epoch: u64,
+    presentation_source: Option<cpal::OutputTimestampSource>,
     diagnostics: SyncDiagnosticsSnapshot,
     feedback: Option<Observation>,
     playback_delta: Duration,
@@ -445,6 +447,7 @@ impl Worker {
         let sync_arc = Arc::clone(&self.sync);
         let sync = sync_arc.try_lock();
         let mut latest_diagnostics = None;
+        let mut latest_presentation = None;
         let visible = self.events.slots();
         for _ in 0..visible {
             let Ok(mut event) = self.events.pop() else {
@@ -456,6 +459,15 @@ impl Worker {
                 latest_diagnostics = Some(event.diagnostics);
                 continue;
             }
+            let frame = event.feedback.and_then(|feedback| {
+                Some(FramePresentation {
+                    media_timestamp_us: feedback.input.source_cursor_us,
+                    presented_at: feedback.input.presentation?,
+                    observed_at: event.diagnostics.captured_at?,
+                    timestamp_source: event.presentation_source?,
+                })
+            });
+            latest_presentation = Some((event.control_epoch, frame));
             if let (Some(sync), Some(input)) = (sync.as_deref(), event.feedback) {
                 if let Some(request) =
                     self.feedback
@@ -472,6 +484,10 @@ impl Worker {
             }
             latest_diagnostics = Some(event.diagnostics);
             self.latest = Some(event);
+        }
+        if let Some((epoch, frame)) = latest_presentation {
+            self.owner
+                .publish_frame_presentation(self.scope, epoch, frame);
         }
         if !self.owner.needs_terminal_check(self.scope) {
             if let Some(sync) = sync.as_deref() {
@@ -1031,6 +1047,8 @@ impl Device {
         });
         drop(callback);
         let _ = self.events.push(Event {
+            control_epoch: view.epoch(),
+            presentation_source: (!timestamp.monotonic_violation).then_some(timestamp.source),
             diagnostics: *observation,
             feedback,
             playback_delta,

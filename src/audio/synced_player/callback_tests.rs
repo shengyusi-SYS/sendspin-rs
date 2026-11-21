@@ -1711,6 +1711,7 @@ fn assert_media_gap(resume_tick: i64, lead_ticks: i64, shift_us: i64) {
             );
             assert_eq!(consumed, 0);
             assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_200_000)));
+            assert_eq!(h.owner.frame_presentation(h.scope), Ok(None));
         }
         if tick == 80 {
             let silent_frames = (shift_us * 48_000 / 1_000_000) as usize;
@@ -1724,6 +1725,20 @@ fn assert_media_gap(resume_tick: i64, lead_ticks: i64, shift_us: i64) {
             assert_eq!(
                 h.owner.consumed_frames(h.scope),
                 Ok(10_080 - silent_frames as u64)
+            );
+            let frame = h.owner.frame_presentation(h.scope).unwrap().unwrap();
+            assert_eq!(frame.media_timestamp_us(), 1_800_000 + shift_us);
+            assert_eq!(
+                frame.presented_at(),
+                h.origin + Duration::from_micros((1_800_000 + shift_us) as u64)
+            );
+            assert_eq!(
+                frame.observed_at(),
+                h.origin + Duration::from_micros(h.now_us - 10_000)
+            );
+            assert_eq!(
+                frame.timestamp_source(),
+                OutputTimestampSource::DevicePresentation
             );
             assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
             assert_eq!(h.owner.media_boundary_us(h.scope), Ok(Some(1_810_000)));
