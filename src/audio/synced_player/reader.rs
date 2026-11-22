@@ -886,8 +886,10 @@ mod smoothing_tests {
 #[cfg(test)]
 mod source_age_tests {
     use super::*;
+    use crate::audio::synced_player::source_age::Control;
     use crate::audio::synced_player::{ingress::ControlGate, transport, PlaybackQueue};
-    use crate::audio::{AudioBuffer, AudioFormat, Codec, SourceFrameTime};
+    use crate::audio::{AudioBuffer, AudioFormat, Codec, SourceAgePolicy, SourceFrameTime};
+    use std::num::NonZeroU32;
     use std::sync::Arc;
 
     // Real Queue -> prepared Frame -> Reader test: two outputs share identical
@@ -896,7 +898,7 @@ mod source_age_tests {
     #[test]
     fn source_age_gates_each_presented_frame_and_keeps_consuming_through_unknown_and_auto() {
         for (extra_delay_us, expected_audible) in [(0, 11), (20_000, 0)] {
-            let (mut producer, mut device) = transport::pipe(1, 62, 1).unwrap();
+            let (mut producer, mut device) = transport::pipe(1, 66, 1).unwrap();
             let mut source = PlaybackQueue::new();
             let format = AudioFormat {
                 codec: Codec::Pcm,
@@ -910,6 +912,25 @@ mod source_age_tests {
                 samples: Arc::from(samples),
                 format: format.clone(),
             };
+            // Old Hold owns the first two frames; the next callback's new
+            // budget sees an expired frame and an unknown one before recovery.
+            source.push_with_source_time(
+                buffer(-4_000, vec![-4, -3]),
+                None,
+                SourceFrameTime::Known {
+                    linear_start_us: None,
+                    fixed_oldest_us: Some(-1_000_000),
+                },
+            );
+            source.push_with_source_time(
+                buffer(-2_000, vec![-2]),
+                None,
+                SourceFrameTime::Known {
+                    linear_start_us: None,
+                    fixed_oldest_us: Some(-1_000_000),
+                },
+            );
+            source.push(buffer(-1_000, vec![-1]));
             source.push_with_source_time(
                 buffer(0, (1..=40).collect()),
                 None,
@@ -933,7 +954,47 @@ mod source_age_tests {
             let checkpoint = PublishedCheckpoint::new();
             let progress = AtomicU64::new(0);
             let mut reader = Reader::new(1);
-            reader.configure_source_age(100, true);
+            let policy = Control::default();
+            policy.set_policy(SourceAgePolicy::Hold);
+            let old_hold = policy.config(); // Callback samples before the setter.
+            policy.set_policy(SourceAgePolicy::Milliseconds(NonZeroU32::new(100).unwrap()));
+            assert!(policy.muted());
+            reader.configure_source_age(old_hold, true);
+            reader.set_presentation(Some(46_000 + extra_delay_us), 1_000, true);
+            let mut held = [1; 2];
+            reader.render(
+                &mut device,
+                &gate.begin_callback(),
+                &checkpoint,
+                &progress,
+                &mut held,
+                false,
+                None,
+            );
+            assert_eq!(
+                held, [0; 2],
+                "the complete old Hold snapshot remains silent after the setter"
+            );
+            assert_eq!(progress.load(Ordering::Acquire), 2);
+            assert!(reader.source_age_muted());
+            reader.configure_source_age(policy.config(), true);
+            reader.set_presentation(Some(48_000 + extra_delay_us), 1_000, true);
+            let mut inadmissible = [1; 2];
+            reader.render(
+                &mut device,
+                &gate.begin_callback(),
+                &checkpoint,
+                &progress,
+                &mut inadmissible,
+                false,
+                None,
+            );
+            assert_eq!(
+                inadmissible, [0; 2],
+                "the new manual snapshot rejects expired and unknown frames"
+            );
+            assert_eq!(progress.load(Ordering::Acquire), 4);
+            assert!(reader.source_age_muted());
             reader.set_presentation(Some(50_000 + extra_delay_us), 1_000, true);
             let mut recovery = [0; 40];
             reader.render(
@@ -970,7 +1031,7 @@ mod source_age_tests {
                 })
                 .collect();
             assert_eq!(output.as_slice(), expected);
-            assert_eq!(progress.load(Ordering::Acquire), 60);
+            assert_eq!(progress.load(Ordering::Acquire), 64);
             assert!(reader.source_age_muted());
 
             reader.set_presentation(Some(110_000 + extra_delay_us), 1_000, true);
@@ -985,8 +1046,9 @@ mod source_age_tests {
                 None,
             );
             assert_eq!(unknown, [0], "unknown is silent on its first frame");
-            assert_eq!(progress.load(Ordering::Acquire), 61);
-            reader.configure_source_age(0, false);
+            assert_eq!(progress.load(Ordering::Acquire), 65);
+            policy.set_policy(SourceAgePolicy::Automatic);
+            reader.configure_source_age(policy.config(), false);
             let mut automatic = [0];
             reader.render(
                 &mut device,
@@ -1003,7 +1065,21 @@ mod source_age_tests {
                 "automatic immediately restores ordinary PCM"
             );
             assert!(!reader.source_age_muted());
-            assert_eq!(progress.load(Ordering::Acquire), 62);
+            assert_eq!(progress.load(Ordering::Acquire), 66);
+            policy.set_policy(SourceAgePolicy::Milliseconds(
+                NonZeroU32::new(u32::MAX).unwrap(),
+            ));
+            let maximum = policy.config();
+            assert_eq!(
+                SourceAgePolicy::from_config(maximum),
+                SourceAgePolicy::Milliseconds(NonZeroU32::new(u32::MAX).unwrap())
+            );
+            policy.set_policy(SourceAgePolicy::Hold);
+            assert_ne!(policy.config(), maximum);
+            assert!(
+                policy.muted(),
+                "Hold remains distinct from every u32 budget"
+            );
         }
     }
 }

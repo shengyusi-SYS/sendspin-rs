@@ -43,6 +43,44 @@ impl SourceFrameTime {
     }
 }
 
+/// Per-output source-age admission, independent of volume and user mute.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceAgePolicy {
+    /// Preserve ordinary playback without source-age admission.
+    #[default]
+    Automatic,
+    /// Render silence while continuing normal media consumption.
+    Hold,
+    /// Admit trustworthy frames no older than this many milliseconds.
+    Milliseconds(NonZeroU32),
+}
+
+// All nonzero u32 millisecond limits coexist with Automatic and Hold. The
+// remaining high 31 bits version the complete immutable callback policy.
+const POLICY_BITS: u32 = 33;
+const POLICY_MASK: u64 = (1 << POLICY_BITS) - 1;
+const HOLD: u64 = 1 << 32;
+
+impl SourceAgePolicy {
+    fn encoded(self) -> u64 {
+        match self {
+            Self::Automatic => 0,
+            Self::Hold => HOLD,
+            Self::Milliseconds(limit) => u64::from(limit.get()),
+        }
+    }
+
+    pub(super) fn from_config(config: u64) -> Self {
+        match config & POLICY_MASK {
+            0 => Self::Automatic,
+            value if value <= u64::from(u32::MAX) => {
+                Self::Milliseconds(NonZeroU32::new(value as u32).expect("nonzero policy"))
+            }
+            _ => Self::Hold,
+        }
+    }
+}
+
 /// Inline in the existing publication Arc. Revision fencing makes a setter
 /// immediately observable without allowing an older callback to clear its mute.
 pub(super) struct Control {
@@ -64,15 +102,15 @@ impl Default for Control {
 }
 
 impl Control {
-    pub(super) fn set_limit(&self, limit: Option<NonZeroU32>) {
-        let limit = u64::from(limit.map_or(0, NonZeroU32::get));
+    pub(super) fn set_policy(&self, policy: SourceAgePolicy) {
+        let policy = policy.encoded();
         let _ = self
             .config
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                if old as u32 == limit as u32 {
+                if old & POLICY_MASK == policy {
                     None
                 } else {
-                    Some((old.wrapping_add(1 << 32) & !u64::from(u32::MAX)) | limit)
+                    Some((old.wrapping_add(1 << POLICY_BITS) & !POLICY_MASK) | policy)
                 }
             });
     }
@@ -83,11 +121,13 @@ impl Control {
 
     pub(super) fn muted(&self) -> bool {
         let config = self.config();
-        if config as u32 == 0 {
-            return false;
+        match SourceAgePolicy::from_config(config) {
+            SourceAgePolicy::Automatic => return false,
+            SourceAgePolicy::Hold => return true,
+            SourceAgePolicy::Milliseconds(_) => {}
         }
         let status = self.status.load(Ordering::Acquire);
-        status >> 32 != config >> 32
+        status >> POLICY_BITS != config >> POLICY_BITS
             || status & 1 != 0
             || self.origin.elapsed().as_micros()
                 >= u128::from(self.live_until_us.load(Ordering::Relaxed))
@@ -99,7 +139,7 @@ impl Control {
         self.live_until_us
             .store(until.min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
         self.status.store(
-            (config & !u64::from(u32::MAX)) | u64::from(muted),
+            (config & !POLICY_MASK) | u64::from(muted),
             Ordering::Release,
         );
     }
@@ -123,7 +163,7 @@ impl Gate {
     }
 
     pub(super) fn unavailable(&mut self) {
-        self.muted = self.config as u32 != 0;
+        self.muted = self.enabled();
         self.healthy_frames = 0;
     }
 
@@ -132,7 +172,7 @@ impl Gate {
     }
 
     pub(super) fn enabled(&self) -> bool {
-        self.config as u32 != 0
+        self.config & POLICY_MASK != 0
     }
 
     pub(super) fn allow(
@@ -141,10 +181,14 @@ impl Gate {
         presentation: Option<i64>,
         rate: u32,
     ) -> bool {
-        let limit_us = i64::from(self.config as u32) * 1_000;
-        if limit_us == 0 {
-            return true;
-        }
+        let limit_us = match SourceAgePolicy::from_config(self.config) {
+            SourceAgePolicy::Automatic => return true,
+            SourceAgePolicy::Hold => {
+                self.unavailable();
+                return false;
+            }
+            SourceAgePolicy::Milliseconds(limit) => i64::from(limit.get()) * 1_000,
+        };
         let age = source
             .zip(presentation)
             .and_then(|(source, now)| now.checked_sub(source));

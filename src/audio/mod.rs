@@ -32,6 +32,6 @@ pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};
 pub use sync_diagnostics::{SyncClockDiagnostics, SyncDiagnosticsReader, SyncDiagnosticsSnapshot};
 pub use synced_player::{
     AudioBufferLifetime, DeviceDelayError, DeviceDelayMs, ProcessCallback, ReanchorRequired,
-    SourceFrameTime, SyncedPlayer, SyncedPlayerConfig,
+    SourceAgePolicy, SourceFrameTime, SyncedPlayer, SyncedPlayerConfig,
 };
 pub use types::{AudioBuffer, AudioFormat, Codec};

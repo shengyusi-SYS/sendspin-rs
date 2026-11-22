@@ -1958,7 +1958,9 @@ fn source_age_callback_reuses_presentation_and_calibration_and_auto_restores_pcm
         let publication = h.queue.lock().publication.clone().unwrap();
         publication
             .source_age
-            .set_limit(std::num::NonZeroU32::new(80));
+            .set_policy(SourceAgePolicy::Milliseconds(
+                std::num::NonZeroU32::new(80).unwrap(),
+            ));
         {
             let mut queue = h.queue.lock();
             for entry in &mut queue.queue {
@@ -1987,7 +1989,9 @@ fn source_age_callback_reuses_presentation_and_calibration_and_auto_restores_pcm
         assert_eq!(consumed, h.frames as u64, "age mute must keep consuming");
         assert!(publication.source_age.muted());
 
-        publication.source_age.set_limit(None);
+        publication
+            .source_age
+            .set_policy(SourceAgePolicy::Automatic);
         let (automatic, consumed) = h.render(OutputTimestampSource::DevicePresentation, 207_000);
         assert!(automatic.iter().all(|sample| *sample > 0.0));
         assert_eq!(consumed, h.frames as u64);

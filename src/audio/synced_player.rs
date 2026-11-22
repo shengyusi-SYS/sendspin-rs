@@ -21,7 +21,6 @@ use parking_lot::Mutex;
 #[cfg(test)]
 use parking_lot::MutexGuard;
 use std::collections::VecDeque;
-use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -33,7 +32,7 @@ mod preparation;
 mod reader;
 mod source;
 mod source_age;
-pub use source_age::SourceFrameTime;
+pub use source_age::{SourceAgePolicy, SourceFrameTime};
 mod transport;
 
 pub(crate) mod ingress;
@@ -1133,18 +1132,21 @@ impl SyncedPlayer {
         self.enqueue_with_optional_lifetime(buffer, None, source_time)
     }
 
-    /// Limit source age at device presentation, in milliseconds. `None` restores
-    /// ordinary automatic playback. Enabling or changing the limit starts muted;
-    /// two healthy 20 ms blocks with spare age budget restore output.
-    pub fn set_source_age_limit(&self, limit: Option<NonZeroU32>) {
-        self.source_age.source_age.set_limit(limit);
+    /// Set source-age admission independently of volume and user mute. Each
+    /// callback uses one complete policy snapshot. Hold silences output while
+    /// consuming media; Automatic restores ordinary playback. A new millisecond
+    /// budget starts muted, recovering after two healthy 20 ms blocks with margin.
+    pub fn set_source_age_policy(&self, policy: SourceAgePolicy) {
+        self.source_age.source_age.set_policy(policy);
     }
 
     /// Whether source-age policy is awaiting healthy, trustworthy output.
     /// Includes unavailable output and observations older than two actual
     /// device callback periods. Automatic playback always reports `false`.
     pub fn source_age_muted(&self) -> bool {
-        if self.source_age.source_age.config() as u32 == 0 {
+        if SourceAgePolicy::from_config(self.source_age.source_age.config())
+            == SourceAgePolicy::Automatic
+        {
             return false;
         }
         let view = self.source_age.control.view();
