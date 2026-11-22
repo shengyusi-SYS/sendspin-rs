@@ -28,6 +28,10 @@ pub(super) struct Rendered {
 
 pub(super) struct Reader {
     last: Vec<i32>,
+    last_source_time: Option<i64>,
+    output_source_time: Option<i64>,
+    source_age: super::source_age::Gate,
+    source_age_trusted: bool,
     position: Option<SourcePosition>,
     minimum_epoch: u64,
     timeline: u64,
@@ -52,6 +56,36 @@ impl Reader {
         self.timing_required = required;
     }
 
+    pub(super) fn configure_source_age(&mut self, config: u64, trusted: bool) {
+        self.source_age.configure(config);
+        self.source_age_trusted = trusted;
+        if !trusted {
+            self.source_age.unavailable();
+        }
+    }
+
+    pub(super) fn source_unavailable(&mut self) {
+        self.source_age.unavailable();
+    }
+
+    pub(super) fn source_age_muted(&self) -> bool {
+        self.source_age.muted()
+    }
+
+    fn gate_output(&mut self, destination: &mut [i32]) {
+        if !self.source_age.enabled() {
+            return;
+        }
+        let presentation = self.presentation.filter(|_| self.source_age_trusted);
+        let now = presentation.and_then(|(now, rate, index)| {
+            i64::try_from(i128::from(now) + index as i128 * 1_000_000 / i128::from(rate)).ok()
+        });
+        let rate = presentation.map_or(1, |(_, rate, _)| rate);
+        if !self.source_age.allow(self.output_source_time, now, rate) {
+            destination.fill(0);
+        }
+    }
+
     pub(super) fn last_capacity(&self) -> usize {
         self.last.capacity()
     }
@@ -60,6 +94,10 @@ impl Reader {
         assert_ne!(channels, 0);
         Self {
             last: vec![0; channels],
+            last_source_time: None,
+            output_source_time: None,
+            source_age: super::source_age::Gate::default(),
+            source_age_trusted: false,
             position: None,
             minimum_epoch: 0,
             timeline: 0,
@@ -198,6 +236,14 @@ impl Reader {
                     }
                 }
             }
+            self.output_source_time = match read {
+                FrameRead::Copy | FrameRead::DiscardBefore(_) => frame.source_time_us,
+                FrameRead::Blend | FrameRead::PeekBlend => self
+                    .output_source_time
+                    .zip(frame.source_time_us)
+                    .map(|(a, b)| a.min(b)),
+                FrameRead::RetireOnly => unreachable!("retirement does not emit provenance"),
+            };
             if matches!(read, FrameRead::PeekBlend) {
                 // The next real output owns this frame and its source cursor.
                 return true;
@@ -351,6 +397,7 @@ impl Reader {
         if cleared || reanchored {
             self.timeline = view.epoch();
             self.position = None;
+            self.source_age.unavailable();
             self.reset_cadence();
         }
         if reanchored {
@@ -360,6 +407,7 @@ impl Reader {
         if cleared {
             callback.finish_current();
             self.last.fill(0);
+            self.last_source_time = None;
         }
         match wanted {
             None => self.reset_cadence(),
@@ -382,6 +430,7 @@ impl Reader {
                 }
             }
             self.waiting = false;
+            self.output_source_time = None;
             let mut step = 1;
             if measured {
                 if self.schedule.drop_every_n_frames > 0 {
@@ -401,6 +450,7 @@ impl Reader {
             }
             if step == 0 {
                 destination.copy_from_slice(&self.last);
+                self.output_source_time = self.last_source_time;
                 // Interpolate between the previous source frame and the next one.
                 // If lookahead is unavailable, retain the existing repeat fallback.
                 self.take_frame(
@@ -418,6 +468,10 @@ impl Reader {
                 } else {
                     rendered.inserted += 1;
                 }
+                if self.waiting {
+                    self.output_source_time = None;
+                }
+                self.gate_output(destination);
                 continue;
             }
             let dropped = step == 2
@@ -447,16 +501,21 @@ impl Reader {
                     rendered.dropped += 1;
                 }
                 self.last.copy_from_slice(destination);
+                self.last_source_time = self.output_source_time;
             } else if dropped {
                 // The first frame is real even when the second falls across a
                 // future gap. Preserve it instead of replacing it with silence.
                 self.last.copy_from_slice(destination);
+                self.last_source_time = self.output_source_time;
             } else if step == 2 && !self.waiting {
                 destination.copy_from_slice(&self.last);
+                self.output_source_time = self.last_source_time;
             } else {
                 destination.fill(0);
+                self.output_source_time = None;
                 rendered.missing += 1;
             }
+            self.gate_output(destination);
             if rendered.first_output_frame.is_none() && self.origin.is_some() {
                 rendered.first_output_frame = Some(index);
             }
@@ -820,6 +879,131 @@ mod smoothing_tests {
             assert_eq!(peak_corner(&smooth), 500);
             assert_eq!(actual.1, source as u64);
             assert_eq!((actual.2, actual.3), if dropping { (0, 4) } else { (4, 0) });
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_age_tests {
+    use super::*;
+    use crate::audio::synced_player::{ingress::ControlGate, transport, PlaybackQueue};
+    use crate::audio::{AudioBuffer, AudioFormat, Codec, SourceFrameTime};
+    use std::sync::Arc;
+
+    // Real Queue -> prepared Frame -> Reader test: two outputs share identical
+    // PCM/provenance but differ in presentation estimate. A whole-block check
+    // would leak the final nine expired frames of the faster output's 20 ms block.
+    #[test]
+    fn source_age_gates_each_presented_frame_and_keeps_consuming_through_unknown_and_auto() {
+        for (extra_delay_us, expected_audible) in [(0, 11), (20_000, 0)] {
+            let (mut producer, mut device) = transport::pipe(1, 62, 1).unwrap();
+            let mut source = PlaybackQueue::new();
+            let format = AudioFormat {
+                codec: Codec::Pcm,
+                sample_rate: 1_000,
+                channels: 1,
+                bit_depth: 32,
+                codec_header: None,
+            };
+            let buffer = |timestamp, samples: Vec<i32>| AudioBuffer {
+                timestamp,
+                samples: Arc::from(samples),
+                format: format.clone(),
+            };
+            source.push_with_source_time(
+                buffer(0, (1..=40).collect()),
+                None,
+                SourceFrameTime::Known {
+                    linear_start_us: Some(0),
+                    fixed_oldest_us: None,
+                },
+            );
+            source.push_with_source_time(
+                buffer(40_000, (41..=60).collect()),
+                None,
+                SourceFrameTime::Known {
+                    linear_start_us: Some(40_000),
+                    fixed_oldest_us: Some(0),
+                },
+            );
+            source.push(buffer(60_000, vec![61, 62]));
+            source.prepare_window(producer.builder_mut(), 0, 0, 1, 1_000);
+            assert!(producer.publish());
+            let gate = ControlGate::default();
+            let checkpoint = PublishedCheckpoint::new();
+            let progress = AtomicU64::new(0);
+            let mut reader = Reader::new(1);
+            reader.configure_source_age(100, true);
+            reader.set_presentation(Some(50_000 + extra_delay_us), 1_000, true);
+            let mut recovery = [0; 40];
+            reader.render(
+                &mut device,
+                &gate.begin_callback(),
+                &checkpoint,
+                &progress,
+                &mut recovery,
+                false,
+                None,
+            );
+            assert_eq!(&recovery[..39], &[0; 39]);
+            assert_eq!(recovery[39], 40, "two healthy 20 ms blocks restore PCM");
+            assert!(!reader.source_age_muted());
+
+            reader.set_presentation(Some(90_000 + extra_delay_us), 1_000, true);
+            let mut output = [0; 20];
+            reader.render(
+                &mut device,
+                &gate.begin_callback(),
+                &checkpoint,
+                &progress,
+                &mut output,
+                false,
+                None,
+            );
+            let expected: Vec<_> = (0..20)
+                .map(|index| {
+                    if index < expected_audible {
+                        41 + index as i32
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            assert_eq!(output.as_slice(), expected);
+            assert_eq!(progress.load(Ordering::Acquire), 60);
+            assert!(reader.source_age_muted());
+
+            reader.set_presentation(Some(110_000 + extra_delay_us), 1_000, true);
+            let mut unknown = [1];
+            reader.render(
+                &mut device,
+                &gate.begin_callback(),
+                &checkpoint,
+                &progress,
+                &mut unknown,
+                false,
+                None,
+            );
+            assert_eq!(unknown, [0], "unknown is silent on its first frame");
+            assert_eq!(progress.load(Ordering::Acquire), 61);
+            reader.configure_source_age(0, false);
+            let mut automatic = [0];
+            reader.render(
+                &mut device,
+                &gate.begin_callback(),
+                &checkpoint,
+                &progress,
+                &mut automatic,
+                false,
+                None,
+            );
+            assert_eq!(
+                automatic,
+                [62],
+                "automatic immediately restores ordinary PCM"
+            );
+            assert!(!reader.source_age_muted());
+            assert_eq!(progress.load(Ordering::Acquire), 62);
         }
     }
 }

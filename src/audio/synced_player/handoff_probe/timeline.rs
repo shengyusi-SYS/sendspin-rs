@@ -137,6 +137,7 @@ impl Preparation {
         let copy = |entry: &super::super::super::QueuedAudioBuffer| {
             super::super::super::QueuedAudioBuffer {
                 source_id: entry.source_id,
+                source_time: entry.source_time,
                 buffer: AudioBuffer {
                     timestamp: entry.timestamp,
                     samples: Arc::clone(&entry.samples),
@@ -159,6 +160,7 @@ impl Preparation {
                 cursor_us: self.cursor.cursor_us,
                 cursor_remainder: self.cursor.cursor_remainder,
                 frame_start_us: self.cursor.frame_start_us,
+                frame_source_time_us: self.cursor.frame_source_time_us,
                 media_end_us: self.cursor.media_end_us,
                 initialized: self.cursor.initialized,
                 generation: self.cursor.generation,

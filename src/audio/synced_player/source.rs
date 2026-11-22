@@ -17,6 +17,7 @@ pub(super) struct Publication {
     pub consumed: Arc<AtomicU64>,
     pub limits: RendererQueueLimits,
     pub channels: usize,
+    pub source_age: super::source_age::Control,
 }
 
 impl Publication {
@@ -34,6 +35,7 @@ impl Publication {
             consumed: owner.consumption_counter(scope)?,
             limits,
             channels,
+            source_age: super::source_age::Control::default(),
         }))
     }
 }
@@ -87,6 +89,7 @@ impl PlaybackQueue {
 
     /// Input has passed format/timestamp validation. Err is an internal non-RT
     /// retry with input ownership preserved, never a new public Full result.
+    #[cfg(test)]
     pub(super) fn try_enqueue_prepared(
         &mut self,
         publication: &Publication,
@@ -94,6 +97,25 @@ impl PlaybackQueue {
         scope: PlayerScope,
         input: PendingInput,
         frames: usize,
+    ) -> Result<EnqueueOutcome, PendingInput> {
+        self.try_enqueue_prepared_with_source_time(
+            publication,
+            owner,
+            scope,
+            input,
+            frames,
+            super::SourceFrameTime::Unknown,
+        )
+    }
+
+    pub(super) fn try_enqueue_prepared_with_source_time(
+        &mut self,
+        publication: &Publication,
+        owner: &RendererOwner,
+        scope: PlayerScope,
+        input: PendingInput,
+        frames: usize,
+        source_time: super::SourceFrameTime,
     ) -> Result<EnqueueOutcome, PendingInput> {
         if owner.needs_terminal_check(scope) {
             return Ok(owner.enqueue_with_actual(scope, frames, || {
@@ -134,7 +156,7 @@ impl PlaybackQueue {
         }
         let (buffer, lifetime) = input;
         Ok(owner.enqueue_with_actual(scope, frames, || {
-            self.push_with_lifetime(buffer, lifetime);
+            self.push_with_source_time(buffer, lifetime, source_time);
             self.enqueue_count += 1;
             (
                 self.queued_frames(publication.channels),

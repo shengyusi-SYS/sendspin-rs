@@ -89,6 +89,7 @@ struct Timing {
     boundary_deadline: Option<Instant>,
     valid_until: Option<Instant>,
     valid: bool,
+    source_age_trusted: bool,
     pending: bool,
 }
 pub(super) struct TimingMailbox {
@@ -138,7 +139,9 @@ impl TimingMailbox {
             .store(self.origin, value.boundary_deadline);
         self.valid_until.store(self.origin, value.valid_until);
         self.flags.store(
-            u8::from(value.valid) | (u8::from(value.pending) << 1),
+            u8::from(value.valid)
+                | (u8::from(value.pending) << 1)
+                | (u8::from(value.source_age_trusted) << 2),
             Ordering::Relaxed,
         );
         self.revision.store(next, Ordering::Release);
@@ -159,6 +162,7 @@ impl TimingMailbox {
             boundary_deadline: self.boundary_deadline.load(self.origin),
             valid_until: self.valid_until.load(self.origin),
             valid: flags & 1 != 0,
+            source_age_trusted: flags & 4 != 0,
             pending: flags & 2 != 0,
         };
         fence(Ordering::Acquire);
@@ -649,6 +653,7 @@ impl Worker {
                         },
                         valid: health.synchronized
                             && (health.last_valid_t4_us.is_none() || valid_until.is_some()),
+                        source_age_trusted: health.settled && !health.stale,
                         valid_until,
                         // A deferred setter does not invalidate the previously
                         // prepared timeline. Initial startup still needs an anchor.
@@ -722,6 +727,9 @@ impl Device {
         let frames = data.len() / channels;
         let sample_rate = self.observation.sample_rate;
         let previous_capture = self.observation.captured_at;
+        let previous_period = Duration::from_secs_f64(
+            self.observation.callback_frames as f64 / f64::from(sample_rate),
+        );
         let observation = &mut self.observation;
         observation.callbacks = observation.callbacks.saturating_add(1);
         observation.requested_frames = observation.requested_frames.saturating_add(frames as u64);
@@ -910,6 +918,23 @@ impl Device {
                 }
             }
         }
+        let age_config = self.publication.source_age.config();
+        self.reader.configure_source_age(
+            age_config,
+            timing_valid
+                && timing.is_some_and(|timing| timing.source_age_trusted)
+                && measured.is_some()
+                && !timestamp.monotonic_violation,
+        );
+        if !audible
+            || frames == 0
+            || leading_silence > 0
+            || previous_capture.is_some_and(|previous| {
+                captured_at.saturating_duration_since(previous) > period.max(previous_period) * 2
+            })
+        {
+            self.reader.source_unavailable();
+        }
         let source_now = timing.filter(|_| timing_valid).and_then(|timing| {
             timing.expected.map(|expected| {
                 let delta = if first_presentation >= expected {
@@ -1032,6 +1057,11 @@ impl Device {
             observation.silent_callbacks = observation.silent_callbacks.saturating_add(1);
             observation.silent_frames = observation.silent_frames.saturating_add(frames as u64);
         }
+        self.publication.source_age.publish(
+            age_config,
+            self.reader.source_age_muted(),
+            captured_at.checked_add(period * 2).unwrap_or(captured_at),
+        );
         let feedback = origin.map(|source_cursor_us| Observation {
             delay_us,
             latency_floor: self.min_latency,

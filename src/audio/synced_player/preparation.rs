@@ -7,6 +7,7 @@ use super::PlaybackQueue;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Frame {
     pub source_start_us: i64,
+    pub source_time_us: Option<i64>,
     pub before_current: u64,
     pub before_index: usize,
     pub requires_epoch: bool,
@@ -17,6 +18,7 @@ impl Default for Frame {
     fn default() -> Self {
         Self {
             source_start_us: 0,
+            source_time_us: None,
             before_current: 0,
             before_index: 0,
             requires_epoch: true,
@@ -89,6 +91,7 @@ impl PlaybackQueue {
         destination.cursor_us = self.cursor_us;
         destination.cursor_remainder = self.cursor_remainder;
         destination.frame_start_us = self.frame_start_us;
+        destination.frame_source_time_us = self.frame_source_time_us;
         destination.media_end_us = self.media_end_us;
         destination.initialized = self.initialized;
         destination.generation = self.generation;
@@ -159,6 +162,7 @@ impl PlaybackQueue {
             );
             let frame = Frame {
                 source_start_us: self.frame_start_us,
+                source_time_us: self.frame_source_time_us,
                 before_current: before.current,
                 before_index: before.index,
                 requires_epoch: remaining == 0,

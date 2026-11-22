@@ -21,6 +21,7 @@ use parking_lot::Mutex;
 #[cfg(test)]
 use parking_lot::MutexGuard;
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -31,6 +32,8 @@ mod feedback;
 mod preparation;
 mod reader;
 mod source;
+mod source_age;
+pub use source_age::SourceFrameTime;
 mod transport;
 
 pub(crate) mod ingress;
@@ -350,6 +353,7 @@ pub trait AudioBufferLifetime: Send + Sync {}
 impl<T: Send + Sync> AudioBufferLifetime for T {}
 
 struct QueuedAudioBuffer {
+    source_time: SourceFrameTime,
     source_id: u64,
     buffer: AudioBuffer,
     _lifetime: Option<Arc<dyn AudioBufferLifetime>>,
@@ -359,6 +363,7 @@ impl Clone for QueuedAudioBuffer {
     fn clone(&self) -> Self {
         Self {
             source_id: self.source_id,
+            source_time: self.source_time,
             buffer: AudioBuffer {
                 timestamp: self.timestamp,
                 samples: Arc::clone(&self.samples),
@@ -396,6 +401,7 @@ struct PlaybackQueue {
     cursor_us: i64,
     cursor_remainder: i64,
     frame_start_us: i64,
+    frame_source_time_us: Option<i64>,
     media_end_us: Option<i64>,
     initialized: bool,
     generation: u64,
@@ -428,6 +434,7 @@ impl PlaybackQueue {
             cursor_us: 0,
             cursor_remainder: 0,
             frame_start_us: 0,
+            frame_source_time_us: None,
             media_end_us: None,
             initialized: false,
             generation: 0,
@@ -462,10 +469,20 @@ impl PlaybackQueue {
         self.push_with_lifetime(buffer, None);
     }
 
+    #[cfg(test)]
     fn push_with_lifetime(
         &mut self,
         buffer: AudioBuffer,
         lifetime: Option<Arc<dyn AudioBufferLifetime>>,
+    ) {
+        self.push_with_source_time(buffer, lifetime, SourceFrameTime::Unknown);
+    }
+
+    fn push_with_source_time(
+        &mut self,
+        buffer: AudioBuffer,
+        lifetime: Option<Arc<dyn AudioBufferLifetime>>,
+        source_time: SourceFrameTime,
     ) {
         let source_id = self.next_source_id;
         self.next_source_id = source_id
@@ -500,6 +517,7 @@ impl PlaybackQueue {
                     .map_or(new_end, |end| end.max(new_end)),
             );
             self.queue.push_back(QueuedAudioBuffer {
+                source_time,
                 source_id,
                 buffer,
                 _lifetime: lifetime,
@@ -549,6 +567,7 @@ impl PlaybackQueue {
             self.queue.insert(
                 pos,
                 QueuedAudioBuffer {
+                    source_time,
                     source_id,
                     buffer,
                     _lifetime: lifetime,
@@ -556,6 +575,7 @@ impl PlaybackQueue {
             );
         } else {
             self.queue.push_back(QueuedAudioBuffer {
+                source_time,
                 source_id,
                 buffer,
                 _lifetime: lifetime,
@@ -625,6 +645,10 @@ impl PlaybackQueue {
         self.frame_start_us = timestamp.saturating_add(
             ((start / channels) as i128 * 1_000_000 / i128::from(sample_rate)) as i64,
         );
+        // Resolve against the PCM frame's media offset, never device queue depth.
+        self.frame_source_time_us = source
+            .source_time
+            .at_offset(((start / channels) as i128 * 1_000_000 / i128::from(sample_rate)) as i64);
         let elapsed = (end / channels) as i128 * 1_000_000;
         self.cursor_us = timestamp.saturating_add((elapsed / i128::from(sample_rate)) as i64);
         self.cursor_remainder = (elapsed % i128::from(sample_rate)) as i64;
@@ -886,6 +910,7 @@ fn set_device_delay_state(
 
 /// Synced audio output with drift correction.
 pub struct SyncedPlayer {
+    source_age: Arc<source::Publication>,
     diagnostics: SyncDiagnosticsReader,
     format: AudioFormat,
     queue: Arc<Mutex<PlaybackQueue>>,
@@ -1062,7 +1087,13 @@ impl SyncedPlayer {
             format.bit_depth,
         );
 
+        let source_age = queue
+            .lock()
+            .publication
+            .clone()
+            .expect("prepared publication installed");
         Ok(Self {
+            source_age,
             diagnostics,
             format,
             queue,
@@ -1079,7 +1110,7 @@ impl SyncedPlayer {
     /// Scheduling uses `buffer.timestamp` (server time in microseconds) for
     /// drift-corrected playback.
     pub fn enqueue(&self, buffer: AudioBuffer) -> EnqueueOutcome {
-        self.enqueue_with_optional_lifetime(buffer, None)
+        self.enqueue_with_optional_lifetime(buffer, None, SourceFrameTime::Unknown)
     }
 
     /// Enqueue a buffer while retaining an opaque owner token until the
@@ -1089,13 +1120,45 @@ impl SyncedPlayer {
         buffer: AudioBuffer,
         lifetime: Arc<dyn AudioBufferLifetime>,
     ) -> EnqueueOutcome {
-        self.enqueue_with_optional_lifetime(buffer, Some(lifetime))
+        self.enqueue_with_optional_lifetime(buffer, Some(lifetime), SourceFrameTime::Unknown)
+    }
+
+    /// Enqueue PCM with its oldest source provenance. Timing describes the
+    /// first frame of this buffer, after any caller-owned format conversion.
+    pub fn enqueue_with_source_time(
+        &self,
+        buffer: AudioBuffer,
+        source_time: SourceFrameTime,
+    ) -> EnqueueOutcome {
+        self.enqueue_with_optional_lifetime(buffer, None, source_time)
+    }
+
+    /// Limit source age at device presentation, in milliseconds. `None` restores
+    /// ordinary automatic playback. Enabling or changing the limit starts muted;
+    /// two healthy 20 ms blocks with spare age budget restore output.
+    pub fn set_source_age_limit(&self, limit: Option<NonZeroU32>) {
+        self.source_age.source_age.set_limit(limit);
+    }
+
+    /// Whether source-age policy is awaiting healthy, trustworthy output.
+    /// Includes unavailable output and observations older than two actual
+    /// device callback periods. Automatic playback always reports `false`.
+    pub fn source_age_muted(&self) -> bool {
+        if self.source_age.source_age.config() as u32 == 0 {
+            return false;
+        }
+        let view = self.source_age.control.view();
+        self.renderer.needs_terminal_check(self.scope)
+            || view.current_revoked()
+            || view.timeline_reanchored()
+            || self.source_age.source_age.muted()
     }
 
     fn enqueue_with_optional_lifetime(
         &self,
         buffer: AudioBuffer,
         lifetime: Option<Arc<dyn AudioBufferLifetime>>,
+        source_time: SourceFrameTime,
     ) -> EnqueueOutcome {
         let channels = self.format.channels as usize;
         let (frames, buffer_duration_us) = match validate_enqueue_buffer(&self.format, &buffer) {
@@ -1108,12 +1171,13 @@ impl SyncedPlayer {
         let outcome = if let Some(publication) = queue.publication.clone() {
             let mut pending = (buffer, lifetime);
             loop {
-                match queue.try_enqueue_prepared(
+                match queue.try_enqueue_prepared_with_source_time(
                     &publication,
                     &self.renderer,
                     self.scope,
                     pending,
                     frames,
+                    source_time,
                 ) {
                     Ok(outcome) => break outcome,
                     Err(input) => {
@@ -1124,7 +1188,7 @@ impl SyncedPlayer {
             }
         } else {
             self.renderer.enqueue_with_actual(self.scope, frames, || {
-                queue.push_with_lifetime(buffer, lifetime);
+                queue.push_with_source_time(buffer, lifetime, source_time);
                 queue.enqueue_count += 1;
                 (queue.queued_frames(channels), queue.buffer_count())
             })

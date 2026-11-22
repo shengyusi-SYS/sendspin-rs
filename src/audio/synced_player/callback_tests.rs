@@ -1947,3 +1947,50 @@ fn assert_late_start_gap(reanchor: bool, suffix_start: i64) {
         assert_eq!(h.diagnostics.snapshot().raw_error_us, Some(0));
     }
 }
+
+// Real worker + CPAL callback: age uses presentation latency and device delay
+// exactly once. Reader-only tests cannot detect a callback clock-domain mistake.
+#[test]
+fn source_age_callback_reuses_presentation_and_calibration_and_auto_restores_pcm() {
+    for calibration_us in [0, 50_000] {
+        let mut h = Harness::new(1_000);
+        h.static_delay_us.store(calibration_us, Ordering::Relaxed);
+        let publication = h.queue.lock().publication.clone().unwrap();
+        publication
+            .source_age
+            .set_limit(std::num::NonZeroU32::new(80));
+        {
+            let mut queue = h.queue.lock();
+            for entry in &mut queue.queue {
+                entry.source_time = SourceFrameTime::Known {
+                    linear_start_us: Some(entry.timestamp - 50_000),
+                    fixed_oldest_us: None,
+                };
+            }
+        }
+        for _ in 0..6 {
+            h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        }
+        assert!(
+            !publication.source_age.muted(),
+            "calibration {calibration_us}"
+        );
+        let (healthy, consumed) = h.render(OutputTimestampSource::DevicePresentation, 167_000);
+        assert!(healthy.iter().all(|sample| *sample > 0.0));
+        assert_eq!(consumed, h.frames as u64);
+
+        let (late, consumed) = h.render(OutputTimestampSource::DevicePresentation, 207_000);
+        assert!(
+            late.iter().all(|sample| *sample == 0.0),
+            "40 ms additional output latency exceeds the 80 ms age budget"
+        );
+        assert_eq!(consumed, h.frames as u64, "age mute must keep consuming");
+        assert!(publication.source_age.muted());
+
+        publication.source_age.set_limit(None);
+        let (automatic, consumed) = h.render(OutputTimestampSource::DevicePresentation, 207_000);
+        assert!(automatic.iter().all(|sample| *sample > 0.0));
+        assert_eq!(consumed, h.frames as u64);
+        assert!(!publication.source_age.muted());
+    }
+}

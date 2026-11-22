@@ -66,7 +66,13 @@ impl HeadlessPlayerHarness {
             diagnostics.clone(),
         )
         .map_err(|error| OpenError::Backend(OutputBackendError::new(error.to_string())))?;
+        let source_age = queue
+            .lock()
+            .publication
+            .clone()
+            .expect("prepared publication installed");
         let player = Arc::new(SyncedPlayer {
+            source_age,
             diagnostics,
             format,
             queue,
