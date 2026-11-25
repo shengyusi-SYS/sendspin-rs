@@ -40,13 +40,24 @@ pub struct HeadlessPlayerHarness {
 
 impl HeadlessPlayerHarness {
     pub fn new(format: AudioFormat, limits: RendererQueueLimits) -> Result<Self, OpenError> {
-        validate_output_format(&format)?;
         let origin = Instant::now();
         let clock = Arc::new(Mutex::new(ClockSync::new_same_clock(Arc::new(TestClock(
             origin,
         )))));
         let renderer = RendererOwner::new(limits);
         let scope = renderer.mint_scope()?;
+        Self::with_clock_and_renderer(format, clock, renderer, scope, origin)
+    }
+
+    /// Run the regular callback in the clock and renderer scope already owned by the caller.
+    pub fn with_clock_and_renderer(
+        format: AudioFormat,
+        clock: Arc<Mutex<ClockSync>>,
+        renderer: RendererOwner,
+        scope: PlayerScope,
+        origin: Instant,
+    ) -> Result<Self, OpenError> {
+        validate_output_format(&format)?;
         let queue = Arc::new(Mutex::new(PlaybackQueue::new()));
         let gain = GainControl::new(100, false);
         let static_delay_us = Arc::new(AtomicU64::new(0));
@@ -92,6 +103,11 @@ impl HeadlessPlayerHarness {
 
     pub fn player(&self) -> Arc<SyncedPlayer> {
         self.player.clone()
+    }
+
+    /// Advance the non-realtime worker between two simulated device callbacks.
+    pub fn prepare_at(&mut self, now_us: u64) {
+        self.worker.step(self.origin + Duration::from_micros(now_us));
     }
 
     /// `now_us` is the callback time; `latency_us` supplies trusted device
