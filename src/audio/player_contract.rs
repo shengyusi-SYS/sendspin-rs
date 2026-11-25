@@ -9,7 +9,7 @@ use parking_lot::MutexGuard;
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const CALLBACK_CLOSED: u64 = 1 << 63;
 const CALLBACK_COUNT_MASK: u64 = !CALLBACK_CLOSED;
@@ -429,6 +429,42 @@ impl RendererCapacitySnapshot {
     }
 }
 
+/// The next callback window estimated from one actual device callback, even
+/// while silent. Hosts must assess freshness and leave time for preparation;
+/// callback scheduling jitter can move the next actual deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallbackWindow {
+    pub(crate) scope: PlayerScope,
+    pub(crate) observed_at: Instant,
+    pub(crate) next_callback_at: Instant,
+    pub(crate) next_presentation_at: Instant,
+    pub(crate) period: Duration,
+    pub(crate) timestamp_source: OutputTimestampSource,
+}
+
+impl CallbackWindow {
+    /// Local instant at which the source callback was captured.
+    pub fn observed_at(self) -> Instant {
+        self.observed_at
+    }
+    /// Estimated next callback deadline for delivering prepared media.
+    pub fn next_callback_at(self) -> Instant {
+        self.next_callback_at
+    }
+    /// Estimated physical endpoint presentation of the next callback's first frame.
+    pub fn next_presentation_at(self) -> Instant {
+        self.next_presentation_at
+    }
+    /// Duration of the sampled callback's requested frames.
+    pub fn period(self) -> Duration {
+        self.period
+    }
+    /// Host provenance of the measured endpoint presentation time.
+    pub fn timestamp_source(self) -> OutputTimestampSource {
+        self.timestamp_source
+    }
+}
+
 /// The first real media frame in an output callback and its matching device time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FramePresentation {
@@ -605,6 +641,8 @@ struct ScopeState {
     consumed_frames: Arc<AtomicU64>,
     media_boundary: Arc<MediaBoundary>,
     frame_presentation: Option<(u64, FramePresentation)>,
+    callback_window: Option<CallbackWindow>,
+    selected_callback_start: Option<CallbackWindow>,
     last_boundary: Option<i64>,
     fault: Option<RendererFault>,
     terminal: Option<RendererTerminal>,
@@ -625,6 +663,8 @@ impl ScopeState {
             consumed_frames: Arc::new(AtomicU64::new(0)),
             media_boundary: Arc::new(MediaBoundary::default()),
             frame_presentation: None,
+            callback_window: None,
+            selected_callback_start: None,
             last_boundary: None,
             fault: None,
             terminal: None,
@@ -692,6 +732,7 @@ impl ScopeState {
 
     fn clear_queued_state(&mut self) {
         self.frame_presentation = None;
+        self.selected_callback_start = None;
         self.queued_frames = 0;
         self.queued_buffers = 0;
         if !matches!(self.control.start_state(), StartState::BoundaryWon { .. }) {
@@ -1506,6 +1547,74 @@ impl RendererOwner {
     ) -> Result<Option<i64>, RendererOperationOutcome> {
         self.media_boundary_publisher(scope)
             .map(|boundary| boundary.read())
+    }
+
+    /// Read the latest physical callback window for this open scope. Missing or
+    /// fallback device timestamps yield None; no media needs to have played.
+    pub fn callback_window(
+        &self,
+        scope: PlayerScope,
+    ) -> Result<Option<CallbackWindow>, RendererOperationOutcome> {
+        let owner = self.shared.state.lock();
+        let state = owner
+            .current
+            .as_ref()
+            .filter(|state| state.scope == scope)
+            .ok_or(RendererOperationOutcome::StaleScope)?;
+        Ok(state.accepting.then_some(state.callback_window).flatten())
+    }
+
+    pub(crate) fn publish_callback_window(
+        &self,
+        scope: PlayerScope,
+        window: Option<CallbackWindow>,
+    ) {
+        let mut owner = self.shared.state.lock();
+        if let Some(state) = owner
+            .current
+            .as_mut()
+            .filter(|state| state.scope == scope && state.accepting)
+        {
+            state.callback_window = window;
+        }
+    }
+
+    /// Explicitly use a sampled callback window for the first source reanchor.
+    /// False means the observation was replaced or playback already began.
+    /// The caller must enqueue and prepare before next_callback_at; this does
+    /// not arm playback or bypass the existing scheduled-start/cancel gate.
+    pub fn select_callback_start(
+        &self,
+        scope: PlayerScope,
+        window: CallbackWindow,
+    ) -> Result<bool, RendererOperationOutcome> {
+        let mut owner = self.shared.state.lock();
+        let state = owner
+            .current
+            .as_mut()
+            .filter(|state| state.scope == scope)
+            .ok_or(RendererOperationOutcome::StaleScope)?;
+        if !state.accepting || state.terminal_state != TerminalState::Open {
+            return Err(RendererOperationOutcome::Closed);
+        }
+        if window.scope != scope
+            || state.callback_window != Some(window)
+            || state.consumed_frames.load(Ordering::Acquire) != 0
+            || matches!(state.control.start_state(), StartState::BoundaryWon { .. })
+        {
+            return Ok(false);
+        }
+        state.selected_callback_start = Some(window);
+        Ok(true)
+    }
+
+    pub(crate) fn selected_callback_start(&self, scope: PlayerScope) -> Option<CallbackWindow> {
+        let owner = self.shared.state.lock();
+        owner
+            .current
+            .as_ref()
+            .filter(|state| state.scope == scope && state.accepting)
+            .and_then(|state| state.selected_callback_start)
     }
 
     /// Read the latest same-frame observation from this renderer's active timeline.

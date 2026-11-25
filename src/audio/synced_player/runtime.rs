@@ -173,6 +173,7 @@ impl TimingMailbox {
 #[derive(Clone, Copy)]
 pub(super) struct Event {
     control_epoch: u64,
+    callback_window: Option<CallbackWindow>,
     presentation_source: Option<cpal::OutputTimestampSource>,
     diagnostics: SyncDiagnosticsSnapshot,
     feedback: Option<Observation>,
@@ -452,11 +453,15 @@ impl Worker {
         let sync = sync_arc.try_lock();
         let mut latest_diagnostics = None;
         let mut latest_presentation = None;
+        let mut latest_callback_window = None;
         let visible = self.events.slots();
         for _ in 0..visible {
             let Ok(mut event) = self.events.pop() else {
                 break;
             };
+            // Physical callback timing belongs to the scope, independent of a
+            // media generation or an initialized source timeline.
+            latest_callback_window = Some(event.callback_window);
             if event.diagnostics.generation != self.generation {
                 // A delayed event can still report telemetry, but cannot supply
                 // the new generation's startup latency or correction history.
@@ -493,6 +498,9 @@ impl Worker {
             self.owner
                 .publish_frame_presentation(self.scope, epoch, frame);
         }
+        if let Some(window) = latest_callback_window {
+            self.owner.publish_callback_window(self.scope, window);
+        }
         if !self.owner.needs_terminal_check(self.scope) {
             if let Some(sync) = sync.as_deref() {
                 let queue_arc = Arc::clone(&self.queue);
@@ -524,13 +532,22 @@ impl Worker {
                                 } else {
                                     Duration::ZERO
                                 };
+                                let selected_start = (explicit && !event.started)
+                                    .then(|| self.owner.selected_callback_start(self.scope))
+                                    .flatten()
+                                    .filter(|window| now < window.next_callback_at())
+                                    .map(CallbackWindow::next_presentation_at);
                                 let outcome = queue.try_reanchor_prepared(
                                     &self.publication,
                                     &self.owner,
                                     self.scope,
                                     || {
-                                        let anchor =
-                                            now.checked_add(anchor_delta)?.checked_add(handoff)?;
+                                        let anchor = match selected_start {
+                                            Some(anchor) => anchor,
+                                            None => now
+                                                .checked_add(anchor_delta)?
+                                                .checked_add(handoff)?,
+                                        };
                                         let client = sync.instant_to_client_micros(anchor);
                                         let client =
                                             i64::try_from(i128::from(client) + i128::from(delay))
@@ -1078,6 +1095,20 @@ impl Device {
         drop(callback);
         let _ = self.events.push(Event {
             control_epoch: view.epoch(),
+            callback_window: measured
+                .filter(|_| frames > 0 && !timestamp.monotonic_violation)
+                .and_then(|latency| {
+                    Some(CallbackWindow {
+                        scope,
+                        observed_at: captured_at,
+                        next_callback_at: captured_at.checked_add(period)?,
+                        next_presentation_at: captured_at
+                            .checked_add(latency)?
+                            .checked_add(period)?,
+                        period,
+                        timestamp_source: timestamp.source,
+                    })
+                }),
             presentation_source: (!timestamp.monotonic_violation).then_some(timestamp.source),
             diagnostics: *observation,
             feedback,

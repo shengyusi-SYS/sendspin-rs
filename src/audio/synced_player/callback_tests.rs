@@ -272,6 +272,88 @@ impl Harness {
 }
 
 #[test]
+fn silent_callback_window_starts_frame_zero_with_device_delay() {
+    let mut h = Harness::configured(
+        48_000,
+        2,
+        RendererQueueLimits::new(4_800, 4, 4_800).unwrap(),
+        false,
+    );
+    assert_eq!(h.owner.clear(h.scope), RendererOperationOutcome::Applied);
+    h.static_delay_us.store(5_000, Ordering::Relaxed);
+    assert_eq!(h.owner.callback_window(h.scope), Ok(None));
+    let (silent, consumed) = h.render(OutputTimestampSource::DevicePresentation, 20_000);
+    assert!(silent.iter().all(|sample| *sample == 0.0));
+    assert_eq!(consumed, 0);
+    let window = h.owner.callback_window(h.scope).unwrap().unwrap();
+    assert_eq!(window.observed_at(), h.origin);
+    assert_eq!(
+        window.next_callback_at(),
+        h.origin + Duration::from_millis(10)
+    );
+    assert_eq!(
+        window.next_presentation_at(),
+        h.origin + Duration::from_millis(30)
+    );
+    assert_eq!(window.period(), Duration::from_millis(10));
+    assert_eq!(h.owner.frame_presentation(h.scope), Ok(None));
+    assert_eq!(h.owner.select_callback_start(h.scope, window), Ok(true));
+
+    let start_us = 35_000; // 30ms device presentation + 5ms calibration.
+    assert_eq!(
+        h.owner.arm_scheduled_start(h.scope, start_us),
+        ScheduledArmOutcome::Armed
+    );
+    assert!(matches!(
+        h.owner.enqueue_with_actual(h.scope, 960, || {
+            let mut queue = h.queue.lock();
+            queue.push(AudioBuffer {
+                timestamp: start_us,
+                samples: (1..=960)
+                    .flat_map(|frame| [frame * 1024; 2])
+                    .collect::<Vec<_>>()
+                    .into(),
+                format: AudioFormat {
+                    codec: Codec::Pcm,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bit_depth: 32,
+                    codec_header: None,
+                },
+            });
+            (queue.queued_frames(2), queue.buffer_count())
+        }),
+        EnqueueOutcome::Accepted { .. }
+    ));
+    // Preparation happens between callbacks, not at the sampled callback instant.
+    h.worker.step(h.origin + Duration::from_millis(5));
+    let (output, consumed) = h.render(OutputTimestampSource::DevicePresentation, 20_000);
+    assert_eq!(consumed, 480);
+    for (frame, stereo) in output.chunks_exact(2).enumerate() {
+        let expected = (frame + 1) as f32 / 2_097_152.0;
+        assert_eq!(stereo, [expected, expected]);
+    }
+    assert_eq!(
+        h.owner
+            .frame_presentation(h.scope)
+            .unwrap()
+            .unwrap()
+            .media_timestamp_us(),
+        start_us
+    );
+    let (next, consumed) = h.render(OutputTimestampSource::DevicePresentation, 20_000);
+    assert_eq!(consumed, 480);
+    for (frame, stereo) in next.chunks_exact(2).enumerate() {
+        let expected = (frame + 481) as f32 / 2_097_152.0;
+        assert_eq!(stereo, [expected, expected]);
+    }
+    h.render(OutputTimestampSource::MonotonicFallback, 0);
+    assert_eq!(h.owner.callback_window(h.scope), Ok(None));
+    assert_eq!(h.owner.close(h.scope), RendererOperationOutcome::Applied);
+    assert_eq!(h.owner.callback_window(h.scope), Ok(None));
+}
+
+#[test]
 fn callback_capacity_512_frames_keeps_continuous_pcm() {
     assert_callback_capacity(&[512], Some(512));
 }

@@ -5,7 +5,7 @@ use crate::audio::gain::{GainControl, GainRamp};
 #[cfg(test)]
 use crate::audio::player_contract::RendererCallbackPermit;
 use crate::audio::player_contract::{
-    EnqueueOutcome, FramePresentation, OpenError, OutputBackendError, PlayerScope,
+    CallbackWindow, EnqueueOutcome, FramePresentation, OpenError, OutputBackendError, PlayerScope,
     PreStartAbortOutcome, RendererCapacitySnapshot, RendererFault, RendererHealthSnapshot,
     RendererOperationOutcome, RendererOwner, RendererQueueLimits, ScheduledArmOutcome,
     ScheduledStartOutcome, StartState, TerminalOutcome,
@@ -1298,6 +1298,11 @@ impl SyncedPlayer {
     /// Read complete typed renderer health from the scope-fenced owner.
     pub fn renderer_health(&self) -> Result<RendererHealthSnapshot, RendererOperationOutcome> {
         self.renderer.health(self.scope)
+    }
+
+    /// Latest physical device callback window, including silent callbacks.
+    pub fn callback_window(&self) -> Result<Option<CallbackWindow>, RendererOperationOutcome> {
+        self.renderer.callback_window(self.scope)
     }
 
     /// Read committed consumption without waiting for timestamp telemetry.
